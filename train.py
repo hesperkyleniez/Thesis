@@ -33,7 +33,7 @@ from config import (
 # -----------------------------------------------------------------------------
 # Reproducibility and device
 # -----------------------------------------------------------------------------
-TRAINING_VERSION = "v8_per_speaker_f0"
+TRAINING_VERSION = "v9_fusion_matrix_window_cap"
 
 
 def set_seed(seed=SEED):
@@ -48,6 +48,10 @@ def set_seed(seed=SEED):
 set_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_AMP = device.type == "cuda"
+
+# Safe CUDA throughput setting. Reproducibility remains controlled by the seed.
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
 
 
 # -----------------------------------------------------------------------------
@@ -105,19 +109,12 @@ class HybridDataset(Dataset):
                     full_f0 = d["f0"]
 
                     if max_windows is not None and n > max_windows:
-                        filename_bytes = os.path.basename(path).encode("utf-8")
-                        stable_hash = int(
-                            hashlib.md5(filename_bytes).hexdigest(), 16
+                        # Deterministic coverage cap. Evenly spaced windows retain
+                        # the beginning, middle, and end of long recordings instead
+                        # of repeatedly drawing the same arbitrary subset.
+                        indices = np.linspace(
+                            0, n - 1, max_windows, dtype=np.int64
                         )
-                        file_seed = seed + (stable_hash % 100000)
-                        rng = np.random.RandomState(file_seed)
-
-                        indices = rng.choice(
-                            np.arange(n, dtype=np.int64),
-                            max_windows,
-                            replace=False,
-                        )
-                        indices.sort()
                     else:
                         indices = np.arange(n, dtype=np.int64)
 

@@ -54,6 +54,11 @@ HOP_SAMPLES   = int(HOP_SEC   * SAMPLE_RATE)   # 8000
 # ── Feature parameters ──────────────────────────────────────────────────────────
 N_MELS        = 128
 N_MFCC        = 40
+# CQCC uses 40 coefficients, matching MFCC dimensionality after pooling.
+N_CQCC        = 40
+CQCC_FMIN     = 32.70319566257483   # C1, Hz
+CQCC_BINS     = 84                  # 7 octaves × 12 bins/octave
+CQCC_BINS_PER_OCTAVE = 12
 N_FFT         = 400    # 25ms at 16kHz
 HOP_LENGTH    = 160    # 10ms at 16kHz
 TARGET_SHAPE  = (128, 128)
@@ -110,7 +115,11 @@ DROPOUT       = 0.5
 # kept, so capping this does not save any I/O -- it only removes training
 # diversity. Set an integer here only if you hit a genuine RAM ceiling; if so,
 # use the highest number you can afford rather than a small one.
-MAX_TRAIN_WINDOWS_PER_FILE = None
+# Cap the number of cached windows contributed by each original training file.
+# This is applied AFTER feature extraction, during training dataset assembly.
+# It prevents unusually long recordings from dominating the optimization while
+# preserving every cached window for validation/test evaluation.
+MAX_TRAIN_WINDOWS_PER_FILE = 6
 MAX_VAL_WINDOWS_PER_FILE   = None
 
 # ── Fusion gate entropy regularization ──────────────────────────────────────────
@@ -127,6 +136,18 @@ MAX_VAL_WINDOWS_PER_FILE   = None
 # (0.01-0.05) and watch get_fusion_weights() move away from a degenerate
 # [~1, ~0, ~0] split across training.
 GATE_ENTROPY_WEIGHT = 0.005
+
+# Final retraining budget policy. The median of the four CV best epochs is used
+# instead of the maximum, which avoids letting one noisy fold determine a long
+# final training run.
+RETRAIN_EPOCH_POLICY = "median"
+
+# Auxiliary prediction-fusion training.
+AUX_BATCH_SIZE = 128
+AUX_HIDDEN = 64
+AUX_DROPOUT = 0.35
+AUX_MAX_EPOCHS = 50
+AUX_PATIENCE = 7
 
 # ── Labels ──────────────────────────────────────────────────────────────────────
 LABEL_REAL = 0

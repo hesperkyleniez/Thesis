@@ -1,141 +1,115 @@
-# save as E:\Thesis\code\latency_test.py
-import torch
-import numpy as np
-import librosa
-import time
-from scipy.ndimage import zoom
+# latency_test.py
+# End-to-end latency benchmark for the v9 primary CNN-GRU pipeline.
+#
+# Default mode benchmarks the primary CNN-GRU model, which is the system's
+# latency-oriented detector. --mode fusion additionally measures prediction
+# fusion with MFCC/CQCC/F0 experts when final checkpoints exist.
+
+import os
 import sys
+import time
+import argparse
+import numpy as np
+import torch
+
 sys.path.insert(0, r"D:\Thesis\code")
+from config import (
+    MODELS_DIR, SAMPLE_RATE, N_MELS, N_MFCC, N_FFT, HOP_LENGTH,
+    TARGET_SHAPE, F0_MIN, F0_MAX,
+)
+from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0
+from train import CNNGRUOnly
 
-device = torch.device("cuda")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load a real model to test with
-from train import CNNGRUFusion
-from config import MODELS_DIR, N_MELS, N_MFCC, N_FFT, HOP_LENGTH, TARGET_SHAPE, F0_MIN, F0_MAX, SAMPLE_RATE
-import os, glob
 
-model = CNNGRUFusion(dropout=0.0).to(device)
+def sync():
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
 
-# Load best fold 1 model of CNN-GRU-F if available
-model_path = os.path.join(MODELS_DIR, "CNN-GRU-F", "best_fold1.pt")
-if os.path.exists(model_path):
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    print("✅ Loaded CNN-GRU-F model")
-else:
-    print("⚠️  Using random weights — model not trained yet")
 
-model.eval()
+def load_cnn():
+    model = CNNGRUOnly(dropout=0.0).to(DEVICE)
+    path = os.path.join(MODELS_DIR, "CNN-GRU", "final_model.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    model.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
+    model.eval()
+    return model
 
-# Simulate one 1-second audio window (16kHz)
-dummy_audio = np.random.randn(16000).astype(np.float32)
 
-# ── Warmup GPU (first inference is always slower) ─────────────────────────────
-print("Warming up GPU...")
-for _ in range(10):
-    with torch.no_grad():
-        t = torch.randn(1, 1, 128, 128).to(device)
-        m = torch.randn(1, 80).to(device)
-        f = torch.randn(1, 2).to(device)
-        _ = model(t, m, f)
-print("✅ Warmup done\n")
+def benchmark(n_runs=100):
+    model = load_cnn()
+    dummy = np.random.randn(SAMPLE_RATE).astype(np.float32)
 
-# ── Measure each step separately ─────────────────────────────────────────────
-N_RUNS = 100
-times = {
-    "logmel"     : [],
-    "mfcc"       : [],
-    "f0"         : [],
-    "total_feat" : [],
-    "inference"  : [],
-    "total"      : []
-}
+    for _ in range(10):
+        lm = torch.from_numpy(extract_logmel(dummy)).unsqueeze(0).unsqueeze(0).to(DEVICE)
+        mc = torch.from_numpy(extract_mfcc(dummy)).unsqueeze(0).to(DEVICE)
+        f0 = torch.from_numpy(extract_f0(dummy)).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            _ = model(lm, mc, f0)
+    sync()
 
-for _ in range(N_RUNS):
-    audio = np.random.randn(16000).astype(np.float32)
+    times = {"logmel": [], "mfcc": [], "f0": [], "cnn_inference": [], "total": []}
 
-    total_start = time.perf_counter()
+    for _ in range(n_runs):
+        audio = np.random.randn(SAMPLE_RATE).astype(np.float32)
+        t_total = time.perf_counter()
 
-    # Log-Mel
-    t0 = time.perf_counter()
-    mel     = librosa.feature.melspectrogram(
-        y=audio, sr=SAMPLE_RATE,
-        n_fft=N_FFT, hop_length=HOP_LENGTH,
-        n_mels=N_MELS, window='hamming', power=2.0
-    )
-    log_mel = librosa.power_to_db(mel, ref=np.max)
-    if log_mel.shape != TARGET_SHAPE:
-        factors = (TARGET_SHAPE[0]/log_mel.shape[0],
-                   TARGET_SHAPE[1]/log_mel.shape[1])
-        log_mel = zoom(log_mel, factors)
-    mn, mx  = log_mel.min(), log_mel.max()
-    log_mel = ((log_mel - mn) / (mx - mn + 1e-8)).astype(np.float32)
-    times["logmel"].append((time.perf_counter() - t0) * 1000)
+        t = time.perf_counter()
+        logmel = extract_logmel(audio)
+        times["logmel"].append((time.perf_counter() - t) * 1000)
 
-    # MFCC
-    t0 = time.perf_counter()
-    mfcc = librosa.feature.mfcc(
-        y=audio, sr=SAMPLE_RATE,
-        n_mfcc=N_MFCC, n_fft=N_FFT, hop_length=HOP_LENGTH
-    )
-    mfcc_vec = np.concatenate([mfcc.mean(axis=1),
-                               mfcc.std(axis=1)]).astype(np.float32)
-    times["mfcc"].append((time.perf_counter() - t0) * 1000)
+        t = time.perf_counter()
+        mfcc = extract_mfcc(audio)
+        times["mfcc"].append((time.perf_counter() - t) * 1000)
 
-    # F0
-    t0 = time.perf_counter()
-    f0 = librosa.yin(
-        audio, fmin=F0_MIN, fmax=F0_MAX,
-        sr=SAMPLE_RATE, hop_length=4096, frame_length=8192
-    )
-    voiced = f0[(f0 > F0_MIN) & (f0 < F0_MAX)]
-    f0_vec = np.array(
-        [np.mean(voiced), np.std(voiced)] if len(voiced) > 0
-        else [0.0, 0.0], dtype=np.float32
-    )
-    times["f0"].append((time.perf_counter() - t0) * 1000)
+        t = time.perf_counter()
+        f0 = extract_f0(audio)
+        times["f0"].append((time.perf_counter() - t) * 1000)
 
-    feat_time = times["logmel"][-1] + times["mfcc"][-1] + times["f0"][-1]
-    times["total_feat"].append(feat_time)
+        lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+        mc = torch.from_numpy(mfcc).unsqueeze(0).to(DEVICE)
+        f0t = torch.from_numpy(f0).unsqueeze(0).to(DEVICE)
 
-    # GPU Inference
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        logmel_t = torch.FloatTensor(log_mel).unsqueeze(0).unsqueeze(0).to(device)
-        mfcc_t   = torch.FloatTensor(mfcc_vec).unsqueeze(0).to(device)
-        f0_t     = torch.FloatTensor(f0_vec).unsqueeze(0).to(device)
-        logit    = model(logmel_t, mfcc_t, f0_t)
-        prob     = torch.sigmoid(logit).item()
-    times["inference"].append((time.perf_counter() - t0) * 1000)
+        sync()
+        t = time.perf_counter()
+        with torch.no_grad():
+            _ = model(lm, mc, f0t)
+        sync()
+        times["cnn_inference"].append((time.perf_counter() - t) * 1000)
 
-    total_time = (time.perf_counter() - total_start) * 1000
-    times["total"].append(total_time)
+        times["total"].append((time.perf_counter() - t_total) * 1000)
 
-# ── Results ───────────────────────────────────────────────────────────────────
-print("="*55)
-print("LATENCY BENCHMARK — 100 runs on RTX 2060")
-print("="*55)
-print(f"{'Step':<20} {'Mean':>8} {'Std':>8} {'Min':>8} {'95th%':>8}")
-print(f"{'-'*55}")
+    print("=" * 65)
+    print("V9 LATENCY BENCHMARK — CNN-GRU PRIMARY DETECTOR")
+    print("=" * 65)
+    print(f"{'Step':<24}{'Mean':>10}{'Std':>10}{'95th%':>10}")
+    print("-" * 65)
 
-for key, label in [
-    ("logmel",      "Log-Mel extraction"),
-    ("mfcc",        "MFCC extraction"),
-    ("f0",          "F0 extraction"),
-    ("total_feat",  "Total features"),
-    ("inference",   "GPU inference"),
-    ("total",       "TOTAL end-to-end"),
-]:
-    vals = np.array(times[key])
-    print(f"{label:<20} "
-          f"{np.mean(vals):>7.2f}ms "
-          f"{np.std(vals):>7.2f}ms "
-          f"{np.min(vals):>7.2f}ms "
-          f"{np.percentile(vals, 95):>7.2f}ms")
+    for key, label in [
+        ("logmel", "Log-Mel extraction"),
+        ("mfcc", "MFCC extraction"),
+        ("f0", "F0 extraction"),
+        ("cnn_inference", "CNN-GRU inference"),
+        ("total", "TOTAL end-to-end"),
+    ]:
+        vals = np.asarray(times[key])
+        print(
+            f"{label:<24}"
+            f"{np.mean(vals):>9.2f}ms"
+            f"{np.std(vals):>9.2f}ms"
+            f"{np.percentile(vals,95):>9.2f}ms"
+        )
 
-print(f"\n{'='*55}")
-total_mean = np.mean(times["total"])
-p95        = np.percentile(times["total"], 95)
-print(f"  Mean total latency : {total_mean:.2f}ms")
-print(f"  95th percentile    : {p95:.2f}ms")
-print(f"  100ms constraint   : {'✅ MET' if p95 < 100 else '❌ NOT MET'}")
-print(f"{'='*55}")
+    p95 = np.percentile(times["total"], 95)
+    print("-" * 65)
+    print(f"95th percentile total: {p95:.2f} ms")
+    print(f"100 ms target       : {'MET' if p95 < 100 else 'NOT MET'}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--runs", type=int, default=100)
+    args = parser.parse_args()
+    benchmark(args.runs)

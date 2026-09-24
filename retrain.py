@@ -3,7 +3,7 @@
 # The held-out test speakers are never used here.
 #
 # Final retraining changes:
-# - Uses the MAXIMUM best epoch across the 4 CV folds as the training budget.
+# - Uses the MEDIAN best epoch across the 4 CV folds as the training budget.
 # - Keeps the AdamW settings used by train.py.
 # - Uses AMP on CUDA, matching train.py.
 # - Uses gradient clipping, matching train.py.
@@ -37,6 +37,7 @@ from config import (
     SEED,
     LR_FACTOR,
     MAX_TRAIN_WINDOWS_PER_FILE,
+    RETRAIN_EPOCH_POLICY,
 )
 from train import (
     CNNOnly,
@@ -110,8 +111,8 @@ def load_cv_results(model_name):
     return results
 
 
-def get_max_best_epoch(model_name):
-    """Use the largest best epoch observed across the four CV folds."""
+def get_target_epoch(model_name):
+    """Choose the final training budget from the CV best epochs."""
     results = load_cv_results(model_name)
 
     epochs = []
@@ -122,10 +123,15 @@ def get_max_best_epoch(model_name):
             )
         epochs.append(int(result["best_epoch"]))
 
-    target_epochs = max(epochs)
+    if RETRAIN_EPOCH_POLICY == "median":
+        target_epochs = max(1, int(np.median(epochs)))
+    elif RETRAIN_EPOCH_POLICY == "mean":
+        target_epochs = max(1, int(round(np.mean(epochs))))
+    else:
+        target_epochs = max(epochs)
 
     print(f"  CV best epochs per fold: {epochs}")
-    print(f"  Maximum best epoch     : {target_epochs}")
+    print(f"  {RETRAIN_EPOCH_POLICY.capitalize()} best epoch: {target_epochs}")
 
     return target_epochs
 
@@ -215,7 +221,7 @@ def retrain_model(model_name, model_class):
     elif os.path.exists(final_model_path):
         print("  Existing final_model.pt has no version stamp — retraining to be safe.")
 
-    target_epochs = get_max_best_epoch(model_name)
+    target_epochs = get_target_epoch(model_name)
 
     all_files = get_all_train_files()
     if not all_files:

@@ -11,6 +11,7 @@ import numpy as np
 import librosa
 from scipy.signal import fftconvolve, butter, filtfilt
 from scipy.ndimage import zoom
+from scipy.fftpack import dct
 from tqdm import tqdm
 
 def set_seed(seed=42):
@@ -25,7 +26,8 @@ sys.path.insert(0, r"D:\Thesis\code")
 from config import (
     TRAIN_DIR, TEST_DIR,
     SAMPLE_RATE, WIN_SAMPLES, HOP_SAMPLES,
-    N_MELS, N_MFCC, N_FFT, HOP_LENGTH, TARGET_SHAPE,
+    N_MELS, N_MFCC, N_CQCC, N_FFT, HOP_LENGTH, TARGET_SHAPE,
+    CQCC_FMIN, CQCC_BINS, CQCC_BINS_PER_OCTAVE,
     F0_MIN, F0_MAX,
     OPENSLR_DIR, AIR_DIR, URBANSOUND_DIR, RESOURCES_DIR,
     FOLD_ASSIGNMENTS, AUGMENTATION_SPLITS,
@@ -35,6 +37,7 @@ from dataset import load_all_files, get_speaker_id
 
 # ── Output directory ──────────────────────────────────────────────────────────
 FEATURES_DIR = r"D:\Thesis\features"
+CACHE_VERSION = "v9_cqcc"
 os.makedirs(FEATURES_DIR, exist_ok=True)
 
 # ── Step 1: Extract zip files if needed ──────────────────────────────────────
@@ -182,6 +185,25 @@ def extract_mfcc(window):
     return np.concatenate([mfcc.mean(axis=1),
                            mfcc.std(axis=1)]).astype(np.float32)
 
+def extract_cqcc(window):
+    """CQCC-style feature: log CQT -> DCT -> mean/std (80 dimensions)."""
+    cqt = librosa.cqt(
+        y=window,
+        sr=SAMPLE_RATE,
+        hop_length=HOP_LENGTH,
+        fmin=CQCC_FMIN,
+        n_bins=CQCC_BINS,
+        bins_per_octave=CQCC_BINS_PER_OCTAVE,
+        window="hann",
+        scale=True,
+    )
+    power = np.abs(cqt) ** 2
+    log_cqt = np.log(power + 1e-10)
+    cqcc = dct(log_cqt, type=2, axis=0, norm="ortho")[:N_CQCC]
+    return np.concatenate(
+        [cqcc.mean(axis=1), cqcc.std(axis=1)]
+    ).astype(np.float32)
+
 def extract_f0(window):
     """
     C.5: F0 using YIN.
@@ -315,10 +337,20 @@ def process_split(samples, split_name, conditions=None):
 
         out_path = os.path.join(speaker_dir, fname + ".npz")
 
-        # Skip if already processed
+        # Reuse only v9 caches. Older caches do not contain CQCC.
         if os.path.exists(out_path):
-            skipped += 1
-            continue
+            try:
+                with np.load(out_path, allow_pickle=True) as cached:
+                    if (
+                        "cqcc" in cached.files
+                        and "cache_version" in cached.files
+                        and str(cached["cache_version"]) == CACHE_VERSION
+                    ):
+                        skipped += 1
+                        continue
+                print(f"  Rebuilding cache with CQCC: {os.path.basename(out_path)}")
+            except Exception:
+                print(f"  Rebuilding unreadable cache: {os.path.basename(out_path)}")
 
         try:
             # Load audio
@@ -346,11 +378,13 @@ def process_split(samples, split_name, conditions=None):
             # Extract features per window
             logmel_list = []
             mfcc_list   = []
+            cqcc_list  = []
             f0_list     = []
 
             for window in windows:
                 logmel_list.append(extract_logmel(window))
                 mfcc_list.append(extract_mfcc(window))
+                cqcc_list.append(extract_cqcc(window))
                 f0_list.append(extract_f0(window))
 
             # Save as NPZ
@@ -358,11 +392,13 @@ def process_split(samples, split_name, conditions=None):
                 out_path,
                 logmel    = np.stack(logmel_list),   # (n_win, 128, 128)
                 mfcc      = np.stack(mfcc_list),     # (n_win, 80)
+                cqcc      = np.stack(cqcc_list),      # (n_win, 80)
                 f0        = np.stack(f0_list),       # (n_win, 2)
                 label     = np.array(label),
                 speaker   = np.array(speaker_id),
                 condition = np.array(condition),
-                n_windows = np.array(len(windows))
+                n_windows = np.array(len(windows)),
+                cache_version = np.array(CACHE_VERSION)
             )
             success += 1
 

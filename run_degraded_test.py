@@ -8,6 +8,7 @@ import numpy as np
 import librosa
 from scipy.signal import fftconvolve, butter, filtfilt
 from scipy.ndimage import zoom
+from scipy.fftpack import dct
 from tqdm import tqdm
 from collections import Counter
 
@@ -21,7 +22,8 @@ def set_seed(seed=42):
 from config import (
     TEST_DIR, FEATURES_DIR, AUGMENTATION_SPLITS,
     SAMPLE_RATE, WIN_SAMPLES, HOP_SAMPLES,
-    N_MELS, N_MFCC, N_FFT, HOP_LENGTH, TARGET_SHAPE,
+    N_MELS, N_MFCC, N_CQCC, N_FFT, HOP_LENGTH, TARGET_SHAPE,
+    CQCC_FMIN, CQCC_BINS, CQCC_BINS_PER_OCTAVE,
     F0_MIN, F0_MAX, OPENSLR_DIR, AIR_DIR, URBANSOUND_DIR,
     LABEL_REAL, LABEL_AI
 )
@@ -145,6 +147,22 @@ def extract_mfcc(window):
     return np.concatenate([mfcc.mean(axis=1),
                            mfcc.std(axis=1)]).astype(np.float32)
 
+def extract_cqcc(window):
+    cqt = librosa.cqt(
+        y=window, sr=SAMPLE_RATE,
+        hop_length=HOP_LENGTH,
+        fmin=CQCC_FMIN,
+        n_bins=CQCC_BINS,
+        bins_per_octave=CQCC_BINS_PER_OCTAVE,
+        window="hann",
+        scale=True,
+    )
+    log_cqt = np.log(np.abs(cqt) ** 2 + 1e-10)
+    cqcc = dct(log_cqt, type=2, axis=0, norm="ortho")[:N_CQCC]
+    return np.concatenate(
+        [cqcc.mean(axis=1), cqcc.std(axis=1)]
+    ).astype(np.float32)
+
 def extract_f0(window):
     """
     F0 using YIN. Frame: 2048 samples, Hop: 512 samples.
@@ -233,8 +251,17 @@ if __name__ == "__main__":
         out_path = os.path.join(speaker_dir, fname + ".npz")
 
         if os.path.exists(out_path):
-            skipped += 1
-            continue
+            try:
+                with np.load(out_path, allow_pickle=True) as cached:
+                    if (
+                        "cqcc" in cached.files
+                        and "cache_version" in cached.files
+                        and str(cached["cache_version"]) == "v9_cqcc"
+                    ):
+                        skipped += 1
+                        continue
+            except Exception:
+                pass
 
         try:
             audio, _ = librosa.load(filepath,
@@ -260,22 +287,26 @@ if __name__ == "__main__":
             # Features
             logmel_list = []
             mfcc_list   = []
+            cqcc_list  = []
             f0_list     = []
 
             for window in windows:
                 logmel_list.append(extract_logmel(window))
                 mfcc_list.append(extract_mfcc(window))
+                cqcc_list.append(extract_cqcc(window))
                 f0_list.append(extract_f0(window))
 
             np.savez_compressed(
                 out_path,
                 logmel    = np.stack(logmel_list),
                 mfcc      = np.stack(mfcc_list),
+                cqcc      = np.stack(cqcc_list),
                 f0        = np.stack(f0_list),
                 label     = np.array(label),
                 speaker   = np.array(speaker_id),
                 condition = np.array(condition),
-                n_windows = np.array(len(windows))
+                n_windows = np.array(len(windows)),
+                cache_version = np.array("v9_cqcc")
             )
             success += 1
 
