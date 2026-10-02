@@ -11,6 +11,7 @@ import os
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 
 import librosa
@@ -27,12 +28,14 @@ from config import (
     LABEL_REAL,
     LABEL_AI,
     SEED,
+    PREP_WORKERS,
+    COMPRESS_FEATURE_CACHE,
 )
-from dataset import load_all_files, extract_windows
+from dataset import load_all_files
 from augmentation import collect_rir_files, apply_augmentation
-from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0, extract_ffv
+from features import extract_clip_features
 
-CACHE_VERSION = "v13_cqcc_ffv_rich_f0"
+CACHE_VERSION = "v14_fast_clip_cqcc_b12_normffv_yin"
 
 
 def set_seed(seed=SEED):
@@ -88,6 +91,52 @@ def output_path(out_dir, filepath, label, speaker_id):
     return os.path.join(speaker_dir, name + ".npz")
 
 
+def _cache_is_current(path):
+    if not os.path.exists(path):
+        return False
+    try:
+        with np.load(path, allow_pickle=True) as d:
+            return (
+                all(k in d.files for k in ("logmel", "mfcc", "cqcc", "f0", "ffv"))
+                and "cache_version" in d.files
+                and str(d["cache_version"]) == CACHE_VERSION
+            )
+    except Exception:
+        return False
+
+
+def _save_cache(path, payload):
+    tmp = path + ".tmp.npz"
+    saver = np.savez_compressed if COMPRESS_FEATURE_CACHE else np.savez
+    saver(tmp, **payload)
+    os.replace(tmp, path)
+
+
+def _process_one(sample, out_dir, conditions, room_rirs, mobile_rirs, urban_files):
+    filepath, label, speaker_id = sample
+    out_path = output_path(out_dir, filepath, label, speaker_id)
+    if _cache_is_current(out_path):
+        return "skipped", None
+    try:
+        audio, _ = librosa.load(filepath, sr=SAMPLE_RATE, mono=True)
+        audio = np.asarray(audio, dtype=np.float32)
+        audio = (audio - np.mean(audio)) / (np.std(audio) + 1e-8)
+        condition = conditions[filepath]
+        audio = apply_augmentation(
+            audio, condition, room_rirs, mobile_rirs, urban_files,
+            rng=pair_rng(filepath),
+        )
+        feat = extract_clip_features(audio)
+        _save_cache(out_path, dict(
+            **feat, label=np.array(label), speaker=np.array(speaker_id),
+            condition=np.array(condition), n_windows=np.array(len(feat["cqcc"])),
+            cache_version=np.array(CACHE_VERSION),
+        ))
+        return "saved", None
+    except Exception as exc:
+        return "error", (os.path.basename(filepath), str(exc))
+
+
 def main():
     set_seed(SEED)
     test_samples = load_all_files(TEST_DIR)
@@ -111,57 +160,23 @@ def main():
     success = skipped = 0
     errors = []
     t0 = time.time()
+    workers = max(1, int(PREP_WORKERS))
+    print(f"Using {workers} feature-preparation worker(s).")
 
-    for filepath, label, speaker_id in tqdm(test_samples, desc="Degraded test"):
-        out_path = output_path(out_dir, filepath, label, speaker_id)
-
-        if os.path.exists(out_path):
-            try:
-                with np.load(out_path, allow_pickle=True) as cached:
-                    if (
-                        "cqcc" in cached.files
-                        and "ffv" in cached.files
-                        and "f0" in cached.files
-                        and "cache_version" in cached.files
-                        and str(cached["cache_version"]) == CACHE_VERSION
-                    ):
-                        skipped += 1
-                        continue
-            except Exception:
-                pass
-
-        try:
-            audio, _ = librosa.load(filepath, sr=SAMPLE_RATE, mono=True)
-            audio = np.asarray(audio, dtype=np.float32)
-            audio = (audio - np.mean(audio)) / (np.std(audio) + 1e-8)
-
-            condition = conditions[filepath]
-            audio = apply_augmentation(
-                audio,
-                condition,
-                room_rirs,
-                mobile_rirs,
-                urban_files,
-                rng=pair_rng(filepath),
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _process_one, sample, out_dir, conditions,
+                room_rirs, mobile_rirs, urban_files,
             )
-
-            windows = extract_windows(audio)
-            np.savez_compressed(
-                out_path,
-                logmel=np.stack([extract_logmel(w) for w in windows]),
-                mfcc=np.stack([extract_mfcc(w) for w in windows]),
-                cqcc=np.stack([extract_cqcc(w) for w in windows]),
-                f0=np.stack([extract_f0(w) for w in windows]),
-                ffv=np.stack([extract_ffv(w) for w in windows]),
-                label=np.array(label),
-                speaker=np.array(speaker_id),
-                condition=np.array(condition),
-                n_windows=np.array(len(windows)),
-                cache_version=np.array(CACHE_VERSION),
-            )
-            success += 1
-        except Exception as exc:
-            errors.append((os.path.basename(filepath), str(exc)))
+            for sample in test_samples
+        ]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Degraded test"):
+            status, err = fut.result()
+            success += status == "saved"
+            skipped += status == "skipped"
+            if err is not None:
+                errors.append(err)
 
     print(f"\nSaved   : {success}")
     print(f"Skipped : {skipped}")

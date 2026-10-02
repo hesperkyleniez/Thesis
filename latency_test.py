@@ -16,10 +16,11 @@ from train import CNNOnly, CNNGRUOnly, CNNGRUFusion
 from cqcc_train import CQCC_DIM, CQCCMLP, CQCC_VERSION
 from ffv_train import FFV_DIM, FFVMLP, FFV_VERSION
 from cqcc_ffv_fusion import load_fusion_model, fusion_predict_proba, summarize_probabilities
+from cqcc_aux_models import CQCCAuxFusion, VERSION as AUX_PAIR_VERSION
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CNN-GRU-CQCC-FFV-F")
+MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CQCC-FFV", "CQCC-F0", "CNN-GRU-CQCC-FFV-F")
 
 
 def sync():
@@ -99,6 +100,31 @@ def build_runner(model_name):
             f0t = torch.from_numpy(f0.astype(np.float32)).unsqueeze(0).to(DEVICE)
             with torch.inference_mode():
                 return torch.sigmoid(model(lm, mc, f0t)).item()
+        return run
+
+    if model_name in ("CQCC-FFV", "CQCC-F0"):
+        aux_name = "ffv" if model_name == "CQCC-FFV" else "f0"
+        aux_dim = 14 if aux_name == "ffv" else 8
+        model_dir = os.path.join(MODELS_DIR, model_name)
+        stats = np.load(os.path.join(model_dir, "final_norm_stats.npy"), allow_pickle=True).item()
+        if stats.get("training_version") != AUX_PAIR_VERSION:
+            raise RuntimeError(f"{model_name} final stats are incompatible; rerun cqcc_aux_models.py")
+        model = CQCCAuxFusion(aux_dim).to(DEVICE)
+        model.load_state_dict(torch.load(os.path.join(model_dir, "final_model.pt"), map_location=DEVICE, weights_only=True))
+        model.eval()
+        cq_mean = np.asarray(stats["cq_mean"], dtype=np.float32)
+        cq_std = np.asarray(stats["cq_std"], dtype=np.float32)
+        ax_mean = np.asarray(stats["aux_mean"], dtype=np.float32)
+        ax_std = np.asarray(stats["aux_std"], dtype=np.float32)
+
+        def run(audio):
+            cq = (extract_cqcc(audio) - cq_mean) / cq_std
+            ax_raw = extract_ffv(audio) if aux_name == "ffv" else extract_f0(audio)
+            ax = (ax_raw - ax_mean) / ax_std
+            cqt = torch.from_numpy(cq.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            axt = torch.from_numpy(ax.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            with torch.inference_mode():
+                return torch.sigmoid(model(cqt, axt)).item()
         return run
 
     if model_name == "CNN-GRU-CQCC-FFV-F":

@@ -56,19 +56,20 @@ HOP_SAMPLES   = int(HOP_SEC   * SAMPLE_RATE)   # 8000
 N_MELS        = 128
 N_MFCC        = 40
 
-# Canonical CQCC front-end (Todisco, Delgado & Evans, 2016/2017).
-# Reference defaults: B=96, fmax=Nyquist, fmin near 20 Hz spanning an integer
-# number of octaves, d=16, and cf=19 (+C0 => 20 static coefficients).
-CQCC_BINS_PER_OCTAVE = 96
+# Runtime-optimized CQCC front-end. The defining CQCC stages are unchanged:
+# CQT -> log power -> uniform-frequency spline resampling -> DCT.
+# B=12 is used by later ASVspoof CQCC baselines and a 2026 deepfake-speech
+# cepstral comparison; 62.5 Hz..8 kHz gives 7 octaves / 84 CQT bins. This is
+# far cheaper than the original B=96 setting while retaining the full speech
+# band and the same 20 static coefficients used by the compact model.
+CQCC_BINS_PER_OCTAVE = 12
 CQCC_FMAX = SAMPLE_RATE / 2.0
-CQCC_OCTAVES = int(math.ceil(math.log2(CQCC_FMAX / 20.0)))
-# 16 kHz audio gives 9 octaves and fmin=15.625 Hz, exactly following the
-# reference default rule fmax / 2^ceil(log2(fmax/20)).
-CQCC_FMIN = CQCC_FMAX / (2 ** CQCC_OCTAVES)
-CQCC_N_BINS = CQCC_BINS_PER_OCTAVE * CQCC_OCTAVES
+CQCC_FMIN = 62.5
+CQCC_OCTAVES = int(round(math.log2(CQCC_FMAX / CQCC_FMIN)))
+CQCC_N_BINS = CQCC_BINS_PER_OCTAVE * CQCC_OCTAVES  # 84
 CQCC_UNIFORM_SAMPLES_FIRST_OCTAVE = 16
-CQCC_NUM_STATIC = 20               # C0 + C1..C19 (Zs / cf=19)
-CQCC_HOP_LENGTH = 512              # rasterization step for the Python CQT
+CQCC_NUM_STATIC = 20
+CQCC_HOP_LENGTH = 512
 CQCC_VECTOR_DIM = CQCC_NUM_STATIC * 2  # frame mean + std => 40-D
 
 N_FFT         = 400    # 25ms at 16kHz
@@ -83,22 +84,21 @@ F0_MAX        = 500.0
 # ── Reproducibility ─────────────────────────────────────────────────────────
 SEED = 42
 
-# ── F0 parameters (updated for acoustic validity) ───────────────────────────
-# Standard speech analysis: 25ms frame, 10ms hop
-# At 16kHz: frame=400 samples, hop=160 samples
-# We use slightly larger for efficiency: frame=2048, hop=512
-F0_FRAME_LENGTH = 2048   # 128ms at 16kHz — acoustically valid
-F0_HOP_LENGTH   = 512    # 32ms at 16kHz — ~31 frames per 1-second window
-# Log F0 is used before computing mean/std (perceptually meaningful)
+# ── F0 parameters ────────────────────────────────────────────────────────────
+# YIN is used for the CQCC+F0 comparison to keep preprocessing inexpensive.
+# The contour is summarized with robust level/dynamics/voicing statistics.
+F0_FRAME_LENGTH = 2048
+F0_HOP_LENGTH   = 512
 F0_LOG          = True
 F0_VECTOR_DIM   = 8
 
-# FFV (Fundamental Frequency Variation) front-end. The representation follows
-# Laskowski et al.: compare left/right half-frame magnitude spectra over a
-# log-frequency dilation axis, then reduce the FFV spectrum with seven filters.
+# FFV (Fundamental Frequency Variation) front-end. features.py follows the
+# normative Laskowski defaults: 32 ms support, 8 ms frame step, 14 ms peak
+# separation, 11/9 ms inner/outer window extents, Ng=512 and the published
+# seven-filter bank. Only the filterbank-active rho samples are evaluated.
 FFV_FRAME_MS = 32.0
-FFV_HOP_MS = 10.0
-FFV_SEPARATION_MS = 8.0
+FFV_HOP_MS = 8.0
+FFV_SEPARATION_MS = 14.0
 FFV_N_FFT = 1024
 FFV_NUM_FILTERS = 7
 FFV_VECTOR_DIM = FFV_NUM_FILTERS * 2  # frame mean + std => 14-D
@@ -134,6 +134,15 @@ AUGMENTATION_SPLITS = {
     "mobile_urban"       : 0.0625,
     "room_urban"         : 0.0625,
 }
+
+
+# ── Dataset preparation runtime ───────────────────────────────────────────────
+# Two file-level workers is a conservative laptop default. Increase to 3-4 only
+# if CPU/RAM headroom is available; feature libraries already use native code.
+PREP_WORKERS = 2
+# Uncompressed NPZ is substantially faster to write/read. Set True only when
+# disk space matters more than preparation/training startup time.
+COMPRESS_FEATURE_CACHE = False
 
 # ── Model hyperparameters ───────────────────────────────────────────────────────
 BATCH_SIZE    = 32
@@ -173,6 +182,13 @@ FFV_HIDDEN = 64
 FFV_DROPOUT = 0.35
 FFV_MAX_EPOCHS = 50
 FFV_PATIENCE = 7
+
+# ── CQCC auxiliary-pair models ────────────────────────────────────────────────
+AUX_PAIR_BATCH_SIZE = 256
+AUX_PAIR_HIDDEN = 64
+AUX_PAIR_DROPOUT = 0.30
+AUX_PAIR_MAX_EPOCHS = 40
+AUX_PAIR_PATIENCE = 6
 
 # ── Labels ──────────────────────────────────────────────────────────────────────
 LABEL_REAL = 0

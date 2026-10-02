@@ -11,6 +11,7 @@ import random
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import librosa
 import numpy as np
@@ -31,12 +32,14 @@ from config import (
     LABEL_REAL,
     LABEL_AI,
     SEED,
+    PREP_WORKERS,
+    COMPRESS_FEATURE_CACHE,
 )
-from dataset import load_all_files, extract_windows
+from dataset import load_all_files
 from augmentation import collect_rir_files, apply_augmentation, peak_normalize
-from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0, extract_ffv
+from features import extract_clip_features
 
-CACHE_VERSION = "v13_cqcc_ffv_rich_f0"
+CACHE_VERSION = "v14_fast_clip_cqcc_b12_normffv_yin"
 
 
 def set_seed(seed=SEED):
@@ -127,73 +130,95 @@ def _output_path(split_name, filepath, label, speaker_id):
     return os.path.join(speaker_dir, name + ".npz")
 
 
+def _cache_is_current(out_path):
+    if not os.path.exists(out_path):
+        return False
+    try:
+        with np.load(out_path, allow_pickle=True) as cached:
+            return (
+                all(k in cached.files for k in ("logmel", "mfcc", "cqcc", "f0", "ffv"))
+                and "cache_version" in cached.files
+                and str(cached["cache_version"]) == CACHE_VERSION
+            )
+    except Exception:
+        return False
+
+
+def _save_cache(out_path, payload):
+    # Atomic replace means Ctrl+C cannot leave a half-written cache that looks valid.
+    tmp_path = out_path + ".tmp.npz"
+    saver = np.savez_compressed if COMPRESS_FEATURE_CACHE else np.savez
+    saver(tmp_path, **payload)
+    os.replace(tmp_path, out_path)
+
+
+def _process_one(sample, split_name, room_rirs, mobile_rirs, urban_files, conditions):
+    filepath, label, speaker_id = sample
+    out_path = _output_path(split_name, filepath, label, speaker_id)
+    if _cache_is_current(out_path):
+        return "skipped", None
+
+    try:
+        audio, _ = librosa.load(filepath, sr=SAMPLE_RATE, mono=True)
+        audio = np.asarray(audio, dtype=np.float32)
+        audio = (audio - np.mean(audio)) / (np.std(audio) + 1e-8)
+
+        condition = conditions.get(filepath, "clean") if conditions else "clean"
+        if condition == "clean":
+            audio = peak_normalize(audio)
+        else:
+            audio = apply_augmentation(
+                audio, condition, room_rirs, mobile_rirs, urban_files,
+                rng=pair_rng(filepath),
+            )
+
+        feat = extract_clip_features(audio)
+        n_windows = len(feat["cqcc"])
+        payload = dict(
+            **feat,
+            label=np.array(label),
+            speaker=np.array(speaker_id),
+            condition=np.array(condition),
+            n_windows=np.array(n_windows),
+            cache_version=np.array(CACHE_VERSION),
+        )
+        _save_cache(out_path, payload)
+        return "saved", None
+    except Exception as exc:
+        return "error", (os.path.basename(filepath), str(exc))
+
+
 def process_split(samples, split_name, room_rirs, mobile_rirs, urban_files, conditions=None):
     success = skipped = 0
     errors = []
-    print(f"\nProcessing {split_name}: {len(samples):,} files")
+    workers = max(1, int(PREP_WORKERS))
+    print(f"\nProcessing {split_name}: {len(samples):,} files with {workers} worker(s)")
 
-    for filepath, label, speaker_id in tqdm(samples):
-        out_path = _output_path(split_name, filepath, label, speaker_id)
-
-        if os.path.exists(out_path):
-            try:
-                with np.load(out_path, allow_pickle=True) as cached:
-                    if (
-                        "cqcc" in cached.files
-                        and "ffv" in cached.files
-                        and "f0" in cached.files
-                        and "cache_version" in cached.files
-                        and str(cached["cache_version"]) == CACHE_VERSION
-                    ):
-                        skipped += 1
-                        continue
-            except Exception:
-                pass
-
-        try:
-            audio, _ = librosa.load(filepath, sr=SAMPLE_RATE, mono=True)
-            audio = np.asarray(audio, dtype=np.float32)
-
-            # Thesis preprocessing: per-audio z-score normalization.
-            audio = (audio - np.mean(audio)) / (np.std(audio) + 1e-8)
-
-            condition = conditions.get(filepath, "clean") if conditions else "clean"
-            if condition == "clean":
-                # Preserve the existing clean preprocessing path exactly.
-                audio = peak_normalize(audio)
-            else:
-                audio = apply_augmentation(
-                    audio,
-                    condition,
-                    room_rirs,
-                    mobile_rirs,
-                    urban_files,
-                    rng=pair_rng(filepath),
+    if workers == 1:
+        iterator = (
+            _process_one(s, split_name, room_rirs, mobile_rirs, urban_files, conditions)
+            for s in tqdm(samples)
+        )
+        for status, err in iterator:
+            success += status == "saved"
+            skipped += status == "skipped"
+            if err is not None:
+                errors.append(err)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    _process_one, s, split_name, room_rirs, mobile_rirs,
+                    urban_files, conditions,
                 )
-
-            windows = extract_windows(audio)
-            logmel = np.stack([extract_logmel(w) for w in windows])
-            mfcc = np.stack([extract_mfcc(w) for w in windows])
-            cqcc = np.stack([extract_cqcc(w) for w in windows])
-            f0 = np.stack([extract_f0(w) for w in windows])
-            ffv = np.stack([extract_ffv(w) for w in windows])
-
-            np.savez_compressed(
-                out_path,
-                logmel=logmel,
-                mfcc=mfcc,
-                cqcc=cqcc,
-                f0=f0,
-                ffv=ffv,
-                label=np.array(label),
-                speaker=np.array(speaker_id),
-                condition=np.array(condition),
-                n_windows=np.array(len(windows)),
-                cache_version=np.array(CACHE_VERSION),
-            )
-            success += 1
-        except Exception as exc:
-            errors.append((os.path.basename(filepath), str(exc)))
+                for s in samples
+            ]
+            for fut in tqdm(as_completed(futures), total=len(futures)):
+                status, err = fut.result()
+                success += status == "saved"
+                skipped += status == "skipped"
+                if err is not None:
+                    errors.append(err)
 
     print(f"  Saved   : {success}")
     print(f"  Skipped : {skipped}")

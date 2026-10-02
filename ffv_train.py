@@ -25,7 +25,7 @@ from config import (
     LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE,
 )
 
-FFV_VERSION = "v13_laskowski_ffv_expert"
+FFV_VERSION = "v14_normative_vectorized_laskowski_ffv_expert"
 
 
 def set_seed(seed=SEED):

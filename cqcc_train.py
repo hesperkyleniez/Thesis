@@ -25,7 +25,7 @@ from config import (
     LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE,
 )
 
-CQCC_VERSION = "v12_canonical_todisco_cqcc_expert"
+CQCC_VERSION = "v14_b12_todisco_pipeline_cqcc_expert"
 
 
 def set_seed(seed=SEED):

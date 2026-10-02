@@ -32,7 +32,7 @@ from config import (
 # -----------------------------------------------------------------------------
 # Reproducibility and device
 # -----------------------------------------------------------------------------
-TRAINING_VERSION = "v13_mfcc_rich_f0"
+TRAINING_VERSION = "v14_mfcc_fast_yin_f0"
 # Preserve unchanged architectures so compatible v11/v12 checkpoints are reused.
 MODEL_VERSIONS = {
     "CNN-only": "v11_clean_four_models_robust_telephone",
@@ -354,7 +354,7 @@ class CNNGRUFusion(nn.Module):
     Thesis feature-fusion model:
       Log-Mel -> CNN-GRU -> 128-D embedding
       MFCC -> pooled 80-D vector
-      F0 -> richer pooled 8-D pYIN/prosody vector
+      F0 -> pooled 8-D YIN/prosody vector
 
     The three representations are weighted by independent learnable scalar
     parameters alpha, beta, and gamma (initialized to 1.0), concatenated, and

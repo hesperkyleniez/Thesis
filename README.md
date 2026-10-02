@@ -1,65 +1,101 @@
-# Filipino Deepfake Speech Detection — v13
+# Filipino Deepfake Speech Detection — runtime-optimized CQCC/FFV comparison
 
-This package retains four reported model configurations:
+This revision prioritizes preprocessing and training runtime while keeping the thesis dataset split, 1.0 s windows with 50% overlap, speaker-grouped 4-fold CV, and degradation-condition proportions unchanged.
 
-1. **CNN-only** — Log-Mel -> CNN.
-2. **CNN-GRU** — Log-Mel -> CNN -> GRU.
-3. **CNN-GRU-F** — original feature-fusion comparison, now using Log-Mel CNN-GRU + MFCC + a richer F0/prosody vector.
-4. **CNN-GRU-CQCC-FFV-F** — refined prediction-level late fusion of independent CNN-GRU, canonical CQCC, and FFV experts.
+## New comparison models
 
-## Feature definitions
+### CQCC-FFV
+A compact two-branch neural fusion model:
 
-### Canonical CQCC
-CQCC follows Todisco, Delgado & Evans: CQT -> log power -> uniform frequency resampling -> DCT. Twenty static coefficients including C0 are summarized by frame mean+std (40-D). The resampling stage is intentionally retained; this is not the earlier "CQCC-style" shortcut.
+- CQCC: 40-D pooled vector -> compact MLP branch
+- FFV: 14-D pooled vector -> compact MLP branch
+- learned positive branch gates
+- concatenation -> small MLP classifier -> fake/real logit
+
+The motivation is Pal, Paul & Saha (Computer Speech & Language, 2018), who showed that CQCC spectral evidence and FFV pitch-variation evidence are complementary for synthetic-speech detection. The model here keeps that complementary pairing but uses a lightweight neural fusion backend instead of their GMM score fusion.
+
+### CQCC-F0
+The exact same fusion architecture and training protocol, except FFV is replaced by an 8-D YIN-derived F0/prosody vector. This makes the CQCC+FFV versus CQCC+F0 comparison controlled: CQCC, folds, optimizer, batch size, classifier capacity, early stopping, and 0.50 decision threshold are shared.
+
+Run both:
+
+```text
+python cqcc_aux_models.py --model all --stage all
+```
+
+Or separately:
+
+```text
+python cqcc_aux_models.py --model CQCC-FFV --stage all
+python cqcc_aux_models.py --model CQCC-F0 --stage all
+```
+
+## Why preparation is much faster
+
+### CQCC
+The defining CQCC pipeline is still CQT -> log power -> uniform-frequency spline resampling -> DCT. The CQT grid is changed from the extremely expensive original-default B=96 configuration to a research-backed B=12 / 84-bin configuration (62.5 Hz to 8 kHz), while retaining d=16 and 20 static coefficients including C0. The spline-resampling plus first 20 DCT coefficients are precomputed as one linear projection.
+
+Most importantly, CQCC is computed once over each padded clip and then pooled into the existing overlapping 1-second windows. The old v13 implementation recomputed the full CQT independently for every overlapping window.
 
 ### FFV
-FFV follows the Laskowski FFV principle: left/right half-frame magnitude spectra are compared under log-frequency dilation and summarized with seven pitch-change regions. Frame mean+std gives a 14-D vector. FFV is trained as an independent expert. This is motivated by Pal, Paul & Saha (2018), who used FFV as complementary pitch-variation evidence with CQCC for synthetic-speech detection.
+FFV now follows the published Laskowski defaults more closely: 32 ms support, 8 ms frame step, 14 ms separation, 11/9 ms inner/outer window extents, Ng=512, and the published seven-filter bank. The code evaluates only rho values actually touched by those seven filters and vectorizes the dilation comparisons across frames.
 
-### Improved F0 in CNN-GRU-F
-The original model still uses MFCC + F0, but F0 is no longer only mean/std. pYIN is used to obtain a frame-level contour and the fixed vector contains log-F0 mean, std, median, IQR, delta absolute mean, delta std, voiced fraction, and voicing-transition rate (8-D). This preserves the original F0 concept while retaining substantially more temporal/voicing information.
+### F0
+The comparison model uses YIN rather than pYIN. This is deliberate for runtime: YIN gives the required frame-level F0 contour without pYIN's additional probabilistic candidate processing and Viterbi decoding. The contour is summarized with log-F0 level, spread, robust range, dynamics, voiced fraction, and voicing-transition rate.
 
-## Degradation methodology
+### Clip-level extraction
+`extract_clip_features()` computes expensive CQCC, FFV and F0 frame streams once per clip and pools them into the unchanged 1.0 s / 0.5 s-overlap windows. Log-Mel and MFCC remain per-window because they are already cheap.
 
-The thesis assignment split is unchanged:
+## Degradation: same split, lower overhead
+
+The assignment proportions are unchanged:
+
 - clean 50%
 - telephone 25%
-- room+Gaussian 6.25%
-- mobile+Gaussian 6.25%
-- mobile+UrbanSound8K 6.25%
-- room+UrbanSound8K 6.25%
+- room + Gaussian 6.25%
+- mobile + Gaussian 6.25%
+- mobile + UrbanSound8K 6.25%
+- room + UrbanSound8K 6.25%
 
-Existing `conditions.npy` and degraded-test condition maps are reused. The v12 thesis-aligned degradation implementation is retained: Gaussian std 0.003, UrbanSound8K 5 dB SNR, RIR wet ratio 0.04 / max 0.10 s, and telephone DRC + 300–3400 Hz band limiting + low-bitrate GSM/Opus codec simulation. No degradation-specific transform is applied to the clean held-out test set.
+The degradation implementation is optimized without changing those conditions:
 
-## Selective retraining / overwrite behavior
+- RIR and UrbanSound audio loads use an LRU cache.
+- Telephone bandpass coefficients are designed once and reused.
+- GSM / Opus codec simulation is retained, but FFmpeg now uses in-memory pipes instead of writing and rereading temporary source/encoded/decoded files.
+- The fallback 8 kHz telephone path uses polyphase resampling.
+- Feature preparation uses two file-level workers by default.
+- Feature NPZ files are uncompressed by default for faster write/read. Set `COMPRESS_FEATURE_CACHE = True` in `config.py` if disk space matters more than speed.
 
-Architecture versions are tracked independently.
-- **CNN-only** keeps version `v11_clean_four_models_robust_telephone`.
-- **CNN-GRU** keeps version `v11_clean_four_models_robust_telephone`.
-- **CNN-GRU-F** is version `v13_mfcc_rich_f0` because its F0 input changed from 2-D to 8-D.
-- **CQCC** keeps the canonical v12 expert version, so a compatible v12 CQCC expert can be reused.
-- **FFV** is new and must train.
-- **CNN-GRU-CQCC-FFV-F** is new and must fit its OOF late-fusion model.
+Existing `conditions.npy` and degraded-test condition maps are still reused, so rerunning preparation does not reshuffle the degradation split.
 
-Therefore, rerunning `train.py --model all` skips compatible existing CNN-only/CNN-GRU folds and retrains only incompatible/new architectures. `retrain.py` applies the same per-model version check to final checkpoints.
-
-## Run order
+## Recommended run order
 
 ```text
 python prepare_dataset.py
-python train.py --model all
-python cqcc_train.py
-python ffv_train.py
-python retrain.py --model all
-python cqcc_retrain.py
-python ffv_retrain.py
 python run_degraded_test.py
-python evaluate.py --model all
-python cqcc_ffv_fusion.py --rebuild-cache
-python latency_test.py
+python cqcc_aux_models.py --model all --stage all
+python latency_test.py --model CQCC-FFV
+python latency_test.py --model CQCC-F0
 ```
 
-`prepare_dataset.py` rebuilds feature caches because F0/FFV changed, but it preserves the existing degradation assignment map. `run_degraded_test.py` likewise preserves the existing held-out degraded condition map.
+The original Log-Mel CNN models are still present if they are needed for the thesis baseline comparison:
 
-## Important
+```text
+python train.py --model all
+python retrain.py --model all
+python evaluate.py --model all
+```
 
-The code changes are methodologically motivated; they do **not** guarantee improved degraded F1. Performance must be established by the new speaker-disjoint CV and held-out clean/degraded evaluations. The fixed 0.50 classification threshold is retained.
+## Cache/version note
+
+The optimized features intentionally use a new cache version because CQCC density, FFV implementation, and F0 extraction changed. Old v13 caches cannot be treated as equivalent. Current caches are skipped safely on reruns, and cache writes use an atomic temporary-file replacement so interrupting preparation does not leave a partially written file marked as complete.
+
+## Research basis
+
+- Todisco, Delgado & Evans (2016/2017): CQCC definition and anti-spoofing motivation.
+- ASVspoof later CQCC baselines: lower B configurations demonstrate that B is a front-end parameter rather than a requirement that must always equal 96.
+- Pal, Paul & Saha (2018): complementary CQCC and FFV evidence for synthetic-speech detection.
+- Laskowski & Edlund (2010), plus Laskowski et al. (2008/2009): normative FFV framing, dilation spectrum and seven-filter representation.
+- de Cheveigne & Kawahara (2002): YIN F0 estimator.
+
+Performance is still an empirical question. The code therefore keeps speaker-disjoint CV, clean held-out evaluation, degraded held-out evaluation, per-condition degraded metrics, and latency measurement rather than assuming that a feature change must improve F1.

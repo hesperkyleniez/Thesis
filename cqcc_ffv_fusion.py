@@ -37,9 +37,9 @@ from ffv_train import FFV_DIM, FFVMLP, FFV_VERSION
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VERSION = "v13_cnn_gru_cqcc_ffv_oof_late_fusion"
+VERSION = "v14_cnn_gru_cqcc_ffv_oof_late_fusion"
 OOF_CACHE_VERSION = VERSION
-FUSION_NAME = "CNN-GRU-CQCC-FFV-FFV-F"
+FUSION_NAME = "CNN-GRU-CQCC-FFV-F"
 MODEL_DIR = os.path.join(MODELS_DIR, "Prediction-Fusion", FUSION_NAME)
 MODEL_PATH = os.path.join(MODEL_DIR, "fusion_model.npy")
 RESULT_PATH = os.path.join(RESULTS_DIR, "cnn_gru_cqcc_ffv_fusion_results.npy")

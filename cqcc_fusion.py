@@ -36,7 +36,7 @@ from cqcc_train import CQCC_DIM, CQCCMLP
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VERSION = "v11_cnn_gru_cqcc_oof_late_fusion"
+VERSION = "v14_cnn_gru_cqcc_b12_oof_late_fusion"
 OOF_CACHE_VERSION = VERSION
 FUSION_NAME = "CNN-GRU-CQCC-F"
 MODEL_DIR = os.path.join(MODELS_DIR, "Prediction-Fusion", FUSION_NAME)
