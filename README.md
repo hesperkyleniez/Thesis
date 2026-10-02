@@ -1,90 +1,65 @@
-# Filipino Speech Deepfake Detection — Clean v11
+# Filipino Deepfake Speech Detection — v13
 
-This codebase contains only the four model configurations retained for the thesis:
+This package retains four reported model configurations:
 
-1. **CNN-only** — Log-Mel spectrogram -> CNN classifier.
-2. **CNN-GRU** — Log-Mel spectrogram -> three CNN blocks -> one 128-unit GRU -> classifier.
-3. **CNN-GRU-F** — thesis feature-fusion model using the CNN-GRU Log-Mel embedding plus pooled MFCC and F0, weighted by learnable scalar parameters `alpha`, `beta`, and `gamma` before classification.
-4. **CNN-GRU-CQCC-F** — prediction-level late fusion of an independent Log-Mel CNN-GRU expert and an independent CQCC expert. A regularized logistic fusion classifier is trained only from speaker-grouped out-of-fold predictions.
+1. **CNN-only** — Log-Mel -> CNN.
+2. **CNN-GRU** — Log-Mel -> CNN -> GRU.
+3. **CNN-GRU-F** — original feature-fusion comparison, now using Log-Mel CNN-GRU + MFCC + a richer F0/prosody vector.
+4. **CNN-GRU-CQCC-FFV-F** — refined prediction-level late fusion of independent CNN-GRU, canonical CQCC, and FFV experts.
 
-There are no standalone MFCC or F0 classifiers and no alternate prediction-fusion combinations in this version. CQCC exists only as the auxiliary expert required by model 4.
+## Feature definitions
 
-## Degradation handling
+### Canonical CQCC
+CQCC follows Todisco, Delgado & Evans: CQT -> log power -> uniform frequency resampling -> DCT. Twenty static coefficients including C0 are summarized by frame mean+std (40-D). The resampling stage is intentionally retained; this is not the earlier "CQCC-style" shortcut.
 
-The original augmentation assignment proportions in `config.py` are unchanged:
+### FFV
+FFV follows the Laskowski FFV principle: left/right half-frame magnitude spectra are compared under log-frequency dilation and summarized with seven pitch-change regions. Frame mean+std gives a 14-D vector. FFV is trained as an independent expert. This is motivated by Pal, Paul & Saha (2018), who used FFV as complementary pitch-variation evidence with CQCC for synthetic-speech detection.
 
-- 50% clean
-- 25% telephone
-- 6.25% room + Gaussian
-- 6.25% mobile + Gaussian
-- 6.25% mobile + UrbanSound8K
-- 6.25% room + UrbanSound8K
+### Improved F0 in CNN-GRU-F
+The original model still uses MFCC + F0, but F0 is no longer only mean/std. pYIN is used to obtain a frame-level contour and the fixed vector contains log-F0 mean, std, median, IQR, delta absolute mean, delta std, voiced fraction, and voicing-transition rate (8-D). This preserves the original F0 concept while retaining substantially more temporal/voicing information.
 
-`prepare_dataset.py` reuses the existing `features/conditions.npy` assignment map when it exists. `run_degraded_test.py` likewise reuses the existing `features/test_degraded/test_degraded_conditions.npy` map, so the held-out degraded condition assignments are not reshuffled.
+## Degradation methodology
 
-The degradation implementation was centralized in `augmentation.py` so training and degraded testing use the same code. The clean path remains the same: per-audio z-score normalization followed by peak normalization and the same feature extraction.
+The thesis assignment split is unchanged:
+- clean 50%
+- telephone 25%
+- room+Gaussian 6.25%
+- mobile+Gaussian 6.25%
+- mobile+UrbanSound8K 6.25%
+- room+UrbanSound8K 6.25%
 
-Robustness changes are limited to degraded audio:
+Existing `conditions.npy` and degraded-test condition maps are reused. The v12 thesis-aligned degradation implementation is retained: Gaussian std 0.003, UrbanSound8K 5 dB SNR, RIR wet ratio 0.04 / max 0.10 s, and telephone DRC + 300–3400 Hz band limiting + low-bitrate GSM/Opus codec simulation. No degradation-specific transform is applied to the clean held-out test set.
 
-- Gaussian noise remains at standard deviation `0.003`.
-- UrbanSound8K mixing now uses the thesis value of **5 dB SNR**.
-- RIR augmentation retains the existing room/mobile conditions and 0.04 wet ratio.
-- Telephone audio now uses **DRC -> 300–3400 Hz telephone bandpass -> low-bitrate codec round-trip**.
-- The telephone condition varies among GSM, Opus 12 kbps, and Opus 16 kbps to reduce dependence on one codec realization.
-- FFmpeg is used for the real codec round-trip when available. A narrow-band companding fallback is included if FFmpeg is unavailable.
-- Degraded audio receives the thesis volume scaling range `[0.8, 1.2]`.
-- Paired Real/AI recordings use the same deterministic degradation draw within their assigned condition.
+## Selective retraining / overwrite behavior
 
-The classification threshold is **0.50 for both clean and degraded evaluation**. There is no degraded-test threshold tuning and no held-out-test calibration.
+Architecture versions are tracked independently.
+- **CNN-only** keeps version `v11_clean_four_models_robust_telephone`.
+- **CNN-GRU** keeps version `v11_clean_four_models_robust_telephone`.
+- **CNN-GRU-F** is version `v13_mfcc_rich_f0` because its F0 input changed from 2-D to 8-D.
+- **CQCC** keeps the canonical v12 expert version, so a compatible v12 CQCC expert can be reused.
+- **FFV** is new and must train.
+- **CNN-GRU-CQCC-FFV-F** is new and must fit its OOF late-fusion model.
 
-The clean evaluation pipeline is not modified by the robustness changes. Because the models are retrained on updated degraded training examples, however, the learned weights can still change and therefore identical clean-test metrics cannot be guaranteed.
+Therefore, rerunning `train.py --model all` skips compatible existing CNN-only/CNN-GRU folds and retrains only incompatible/new architectures. `retrain.py` applies the same per-model version check to final checkpoints.
 
-## Recommended full run
-
-Run these commands from `D:\Thesis\code` in this order:
+## Run order
 
 ```text
 python prepare_dataset.py
 python train.py --model all
 python cqcc_train.py
+python ffv_train.py
 python retrain.py --model all
 python cqcc_retrain.py
+python ffv_retrain.py
 python run_degraded_test.py
 python evaluate.py --model all
-python cqcc_fusion.py --rebuild-cache
+python cqcc_ffv_fusion.py --rebuild-cache
 python latency_test.py
 ```
 
-`train.py --model all` trains only CNN-only, CNN-GRU, and CNN-GRU-F. `cqcc_train.py` and `cqcc_retrain.py` train the internal CQCC expert required for CNN-GRU-CQCC-F. `cqcc_fusion.py` fits the OOF late-fusion classifier and evaluates it on both clean and degraded held-out test data.
+`prepare_dataset.py` rebuilds feature caches because F0/FFV changed, but it preserves the existing degradation assignment map. `run_degraded_test.py` likewise preserves the existing held-out degraded condition map.
 
-If the CNN-GRU and CQCC fold/final checkpoints have already been regenerated with this v11 feature cache, the fusion alone can be checked with:
+## Important
 
-```text
-python cqcc_fusion.py --rebuild-cache
-```
-
-After the OOF cache has been created once, later fusion evaluation can be run with:
-
-```text
-python cqcc_fusion.py --eval-only
-```
-
-## Files
-
-- `config.py` — paths, folds, augmentation split, feature parameters, training parameters.
-- `augmentation.py` — single source of truth for all degraded-audio transformations.
-- `dataset.py` — file discovery, speaker IDs, fold handling, 1-second/50%-overlap windowing.
-- `features.py` — Log-Mel, MFCC, F0, and CQCC extraction.
-- `prepare_dataset.py` — fixed training augmentation and clean held-out feature-cache generation.
-- `run_degraded_test.py` — degraded held-out cache generation while preserving the existing assignment map.
-- `train.py` — 4-fold CV for CNN-only, CNN-GRU, and CNN-GRU-F only.
-- `retrain.py` — final development-set retraining for those three models.
-- `evaluate.py` — clean/degraded evaluation for those three models.
-- `cqcc_train.py` — 4-fold CV for the internal CQCC expert used by model 4.
-- `cqcc_retrain.py` — final retraining of that CQCC expert.
-- `cqcc_fusion.py` — OOF CNN-GRU + CQCC prediction-level late fusion and held-out evaluation.
-- `latency_test.py` — per-window latency benchmark for all four retained model configurations.
-
-## Important cache behavior
-
-The feature cache version is now `v11_robust_telephone`. Old NPZ feature files are automatically rebuilt when `prepare_dataset.py` or `run_degraded_test.py` sees an older cache version. The condition-assignment `.npy` maps are intentionally retained so the assignment split stays fixed.
+The code changes are methodologically motivated; they do **not** guarantee improved degraded F1. Performance must be established by the new speaker-disjoint CV and held-out clean/degraded evaluations. The fixed 0.50 classification threshold is retained.

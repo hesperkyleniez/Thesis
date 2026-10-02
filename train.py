@@ -32,7 +32,16 @@ from config import (
 # -----------------------------------------------------------------------------
 # Reproducibility and device
 # -----------------------------------------------------------------------------
-TRAINING_VERSION = "v11_clean_four_models_robust_telephone"
+TRAINING_VERSION = "v13_mfcc_rich_f0"
+# Preserve unchanged architectures so compatible v11/v12 checkpoints are reused.
+MODEL_VERSIONS = {
+    "CNN-only": "v11_clean_four_models_robust_telephone",
+    "CNN-GRU": "v11_clean_four_models_robust_telephone",
+    "CNN-GRU-F": TRAINING_VERSION,
+}
+
+def model_training_version(name):
+    return MODEL_VERSIONS[name]
 
 
 def set_seed(seed=SEED):
@@ -345,7 +354,7 @@ class CNNGRUFusion(nn.Module):
     Thesis feature-fusion model:
       Log-Mel -> CNN-GRU -> 128-D embedding
       MFCC -> pooled 80-D vector
-      F0 -> pooled 2-D vector
+      F0 -> richer pooled 8-D pYIN/prosody vector
 
     The three representations are weighted by independent learnable scalar
     parameters alpha, beta, and gamma (initialized to 1.0), concatenated, and
@@ -360,7 +369,7 @@ class CNNGRUFusion(nn.Module):
         self.gamma = nn.Parameter(torch.ones(1))
 
         self.classifier = nn.Sequential(
-            nn.Linear(128 + 80 + 2, 128),
+            nn.Linear(128 + 80 + 8, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
@@ -728,7 +737,8 @@ def calculate_eer(labels, probs):
 def train_model(model_name, model_class):
     print(f"\n{'=' * 70}")
     print(f"  TRAINING: {model_name}")
-    print(f"  Version : {TRAINING_VERSION}")
+    version = model_training_version(model_name)
+    print(f"  Version : {version}")
     print(f"{'=' * 70}")
 
     model_dir = os.path.join(MODELS_DIR, model_name)
@@ -748,7 +758,7 @@ def train_model(model_name, model_class):
         try:
             existing = list(np.load(results_path, allow_pickle=True))
             if existing and all(
-                r.get("training_version") == TRAINING_VERSION
+                r.get("training_version") == version
                 for r in existing
             ):
                 fold_results = existing
@@ -914,7 +924,7 @@ def train_model(model_name, model_class):
                 print(f"       {key}: {value:.4f}")
 
         fold_results.append({
-            "training_version": TRAINING_VERSION,
+            "training_version": version,
             "fold": fold,
             "accuracy": acc,
             "f1": f1,

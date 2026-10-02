@@ -30,9 +30,9 @@ from config import (
 )
 from dataset import load_all_files, extract_windows
 from augmentation import collect_rir_files, apply_augmentation
-from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0
+from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0, extract_ffv
 
-CACHE_VERSION = "v11_robust_telephone"
+CACHE_VERSION = "v13_cqcc_ffv_rich_f0"
 
 
 def set_seed(seed=SEED):
@@ -120,6 +120,8 @@ def main():
                 with np.load(out_path, allow_pickle=True) as cached:
                     if (
                         "cqcc" in cached.files
+                        and "ffv" in cached.files
+                        and "f0" in cached.files
                         and "cache_version" in cached.files
                         and str(cached["cache_version"]) == CACHE_VERSION
                     ):
@@ -150,6 +152,7 @@ def main():
                 mfcc=np.stack([extract_mfcc(w) for w in windows]),
                 cqcc=np.stack([extract_cqcc(w) for w in windows]),
                 f0=np.stack([extract_f0(w) for w in windows]),
+                ffv=np.stack([extract_ffv(w) for w in windows]),
                 label=np.array(label),
                 speaker=np.array(speaker_id),
                 condition=np.array(condition),

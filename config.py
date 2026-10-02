@@ -1,5 +1,6 @@
 # config.py — all paths and parameters in one place
 import os
+import math
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR      = r"D:\Thesis"
@@ -54,11 +55,22 @@ HOP_SAMPLES   = int(HOP_SEC   * SAMPLE_RATE)   # 8000
 # ── Feature parameters ──────────────────────────────────────────────────────────
 N_MELS        = 128
 N_MFCC        = 40
-# CQCC uses 40 coefficients, matching MFCC dimensionality after pooling.
-N_CQCC        = 40
-CQCC_FMIN     = 32.70319566257483   # C1, Hz
-CQCC_BINS     = 84                  # 7 octaves × 12 bins/octave
-CQCC_BINS_PER_OCTAVE = 12
+
+# Canonical CQCC front-end (Todisco, Delgado & Evans, 2016/2017).
+# Reference defaults: B=96, fmax=Nyquist, fmin near 20 Hz spanning an integer
+# number of octaves, d=16, and cf=19 (+C0 => 20 static coefficients).
+CQCC_BINS_PER_OCTAVE = 96
+CQCC_FMAX = SAMPLE_RATE / 2.0
+CQCC_OCTAVES = int(math.ceil(math.log2(CQCC_FMAX / 20.0)))
+# 16 kHz audio gives 9 octaves and fmin=15.625 Hz, exactly following the
+# reference default rule fmax / 2^ceil(log2(fmax/20)).
+CQCC_FMIN = CQCC_FMAX / (2 ** CQCC_OCTAVES)
+CQCC_N_BINS = CQCC_BINS_PER_OCTAVE * CQCC_OCTAVES
+CQCC_UNIFORM_SAMPLES_FIRST_OCTAVE = 16
+CQCC_NUM_STATIC = 20               # C0 + C1..C19 (Zs / cf=19)
+CQCC_HOP_LENGTH = 512              # rasterization step for the Python CQT
+CQCC_VECTOR_DIM = CQCC_NUM_STATIC * 2  # frame mean + std => 40-D
+
 N_FFT         = 400    # 25ms at 16kHz
 HOP_LENGTH    = 160    # 10ms at 16kHz
 TARGET_SHAPE  = (128, 128)
@@ -79,6 +91,17 @@ F0_FRAME_LENGTH = 2048   # 128ms at 16kHz — acoustically valid
 F0_HOP_LENGTH   = 512    # 32ms at 16kHz — ~31 frames per 1-second window
 # Log F0 is used before computing mean/std (perceptually meaningful)
 F0_LOG          = True
+F0_VECTOR_DIM   = 8
+
+# FFV (Fundamental Frequency Variation) front-end. The representation follows
+# Laskowski et al.: compare left/right half-frame magnitude spectra over a
+# log-frequency dilation axis, then reduce the FFV spectrum with seven filters.
+FFV_FRAME_MS = 32.0
+FFV_HOP_MS = 10.0
+FFV_SEPARATION_MS = 8.0
+FFV_N_FFT = 1024
+FFV_NUM_FILTERS = 7
+FFV_VECTOR_DIM = FFV_NUM_FILTERS * 2  # frame mean + std => 14-D
 
 
 
@@ -145,6 +168,11 @@ CQCC_HIDDEN = 64
 CQCC_DROPOUT = 0.35
 CQCC_MAX_EPOCHS = 50
 CQCC_PATIENCE = 7
+FFV_BATCH_SIZE = 128
+FFV_HIDDEN = 64
+FFV_DROPOUT = 0.35
+FFV_MAX_EPOCHS = 50
+FFV_PATIENCE = 7
 
 # ── Labels ──────────────────────────────────────────────────────────────────────
 LABEL_REAL = 0

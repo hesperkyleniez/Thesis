@@ -49,7 +49,7 @@ from train import (
     USE_AMP,
     build_optimizer,
     compute_fold_norm_stats,
-    TRAINING_VERSION,
+    TRAINING_VERSION, model_training_version,
 )
 
 
@@ -189,6 +189,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
 
 
 def retrain_model(model_name, model_class):
+    version = model_training_version(model_name)
     print(f"\n{'=' * 70}")
     print(f"  FINAL RETRAINING: {model_name}")
     print(f"{'=' * 70}")
@@ -203,14 +204,14 @@ def retrain_model(model_name, model_class):
     if os.path.exists(final_model_path) and os.path.exists(norm_stats_path):
         try:
             existing_norm = np.load(norm_stats_path, allow_pickle=True).item()
-            if existing_norm.get("training_version") == TRAINING_VERSION:
+            if existing_norm.get("training_version") == version:
                 print("  final_model.pt already exists for this training version — skipping")
                 print(f"  Delete this file if you intentionally want to retrain: {final_model_path}")
                 return
             else:
                 print(
                     f"  Existing final_model.pt is from an older training version "
-                    f"({existing_norm.get('training_version')!r} != {TRAINING_VERSION!r}) "
+                    f"({existing_norm.get('training_version')!r} != {version!r}) "
                     f"— retraining."
                 )
         except Exception as exc:
@@ -240,7 +241,7 @@ def retrain_model(model_name, model_class):
             "mfcc_std": mfcc_std,
             "f0_speaker_stats": f0_speaker_stats,
             "f0_fallback": f0_fallback,
-            "training_version": TRAINING_VERSION,
+            "training_version": version,
         },
     )
     print(f"  Normalization stats saved: {norm_stats_path}")

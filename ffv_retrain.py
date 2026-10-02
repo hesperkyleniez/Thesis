@@ -1,5 +1,5 @@
-# cqcc_retrain.py
-# Final retraining for the CQCC expert used by CNN-GRU + CQCC late fusion.
+# ffv_retrain.py
+# Final retraining for the FFV expert used by CNN-GRU + FFV late fusion.
 
 import os
 import sys
@@ -16,10 +16,10 @@ sys.path.insert(0, r"D:\Thesis\code")
 from config import (
     FEATURES_DIR, MODELS_DIR, LEARNING_RATE, WEIGHT_DECAY,
     SEED, LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE, RETRAIN_EPOCH_POLICY,
-    CQCC_BATCH_SIZE, CQCC_HIDDEN, CQCC_DROPOUT,
+    FFV_BATCH_SIZE, FFV_HIDDEN, FFV_DROPOUT,
 )
-from cqcc_train import (
-    CQCC_FEATURE, CQCC_DIM, CQCC_VERSION, CQCCDataset, CQCCMLP,
+from ffv_train import (
+    FFV_FEATURE, FFV_DIM, FFV_VERSION, FFVDataset, FFVMLP,
     get_all_train_files, make_loader, make_scaler, train_epoch,
     DEVICE, USE_AMP,
 )
@@ -33,10 +33,10 @@ def get_target_epoch(name):
     results = list(np.load(path, allow_pickle=True))
     if len(results) != 4:
         raise RuntimeError(f"{name}: expected 4 CV folds, found {len(results)}")
-    if not all(r.get("training_version") == CQCC_VERSION for r in results):
+    if not all(r.get("training_version") == FFV_VERSION for r in results):
         raise RuntimeError(
-            f"{name}: CV results are from an older CQCC version. "
-            "Run: python cqcc_train.py"
+            f"{name}: CV results are from an older FFV version. "
+            "Run: python ffv_train.py"
         )
 
     epochs = [int(r["best_epoch"]) for r in results]
@@ -53,9 +53,9 @@ def get_target_epoch(name):
     return target
 
 
-def retrain_cqcc():
-    name = "CQCC"
-    feature = CQCC_FEATURE
+def retrain_ffv():
+    name = "FFV"
+    feature = FFV_FEATURE
     model_dir = os.path.join(MODELS_DIR, name)
     os.makedirs(model_dir, exist_ok=True)
 
@@ -64,11 +64,11 @@ def retrain_cqcc():
     if os.path.exists(final_model_path) and os.path.exists(norm_path):
         try:
             existing = np.load(norm_path, allow_pickle=True).item()
-            if existing.get("training_version") == CQCC_VERSION:
+            if existing.get("training_version") == FFV_VERSION:
                 print(f"{name}: current-version final model already exists — skipping retraining.")
                 return
             print(
-                f"{name}: existing final model uses older CQCC version "
+                f"{name}: existing final model uses older FFV version "
                 f"{existing.get('training_version')!r} — retraining."
             )
         except Exception:
@@ -89,21 +89,21 @@ def retrain_cqcc():
     np.save(norm_path, {
         "mean": mean,
         "std": std,
-        "training_version": CQCC_VERSION,
+        "training_version": FFV_VERSION,
         "feature": feature,
     })
 
-    ds = CQCCDataset(
+    ds = FFVDataset(
         files, feature, mean, std,
         max_windows=MAX_TRAIN_WINDOWS_PER_FILE,
         seed=SEED,
     )
     loader = DataLoader(
-        ds, batch_size=CQCC_BATCH_SIZE, shuffle=True, num_workers=0,
+        ds, batch_size=FFV_BATCH_SIZE, shuffle=True, num_workers=0,
         pin_memory=DEVICE.type == "cuda",
     )
 
-    model = CQCCMLP(CQCC_DIM, CQCC_HIDDEN, CQCC_DROPOUT).to(DEVICE)
+    model = FFVMLP(FFV_DIM, FFV_HIDDEN, FFV_DROPOUT).to(DEVICE)
     optimizer = optim.AdamW(
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
@@ -142,4 +142,4 @@ def retrain_cqcc():
 
 
 if __name__ == "__main__":
-    retrain_cqcc()
+    retrain_ffv()

@@ -1,6 +1,6 @@
-# cqcc_train.py
-# Speaker-grouped 4-fold CV for the CQCC expert used only by the
-# CNN-GRU + CQCC prediction-level late-fusion model.
+# ffv_train.py
+# Speaker-grouped 4-fold CV for the FFV expert used only by the
+# CNN-GRU + FFV prediction-level late-fusion model.
 
 import os
 import sys
@@ -20,12 +20,12 @@ sys.path.insert(0, r"D:\Thesis\code")
 from config import (
     FEATURES_DIR, MODELS_DIR, FOLD_ASSIGNMENTS,
     LEARNING_RATE, WEIGHT_DECAY, SEED,
-    CQCC_BATCH_SIZE, CQCC_HIDDEN, CQCC_DROPOUT, CQCC_MAX_EPOCHS, CQCC_PATIENCE,
-    CQCC_VECTOR_DIM,
+    FFV_BATCH_SIZE, FFV_HIDDEN, FFV_DROPOUT, FFV_MAX_EPOCHS, FFV_PATIENCE,
+    FFV_VECTOR_DIM,
     LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE,
 )
 
-CQCC_VERSION = "v12_canonical_todisco_cqcc_expert"
+FFV_VERSION = "v13_laskowski_ffv_expert"
 
 
 def set_seed(seed=SEED):
@@ -46,7 +46,7 @@ if torch.cuda.is_available():
     torch.set_float32_matmul_precision("high")
 
 
-class CQCCDataset(Dataset):
+class FFVDataset(Dataset):
     """Loads only one compact auxiliary representation into RAM."""
 
     def __init__(self, files, feature_name, mean, std, max_windows=None, seed=SEED):
@@ -105,8 +105,8 @@ class CQCCDataset(Dataset):
         return self.x[idx], self.y[idx], self.paths[idx]
 
 
-class CQCCMLP(nn.Module):
-    def __init__(self, input_dim, hidden=CQCC_HIDDEN, dropout=CQCC_DROPOUT):
+class FFVMLP(nn.Module):
+    def __init__(self, input_dim, hidden=FFV_HIDDEN, dropout=FFV_DROPOUT):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -123,8 +123,8 @@ class CQCCMLP(nn.Module):
         return self.net(x)
 
 
-CQCC_FEATURE = "cqcc"
-CQCC_DIM = CQCC_VECTOR_DIM
+FFV_FEATURE = "ffv"
+FFV_DIM = FFV_VECTOR_DIM
 
 
 def get_all_train_files():
@@ -166,7 +166,7 @@ def compute_feature_stats(files, feature_name):
 def make_loader(ds, shuffle, generator=None):
     return DataLoader(
         ds,
-        batch_size=CQCC_BATCH_SIZE,
+        batch_size=FFV_BATCH_SIZE,
         shuffle=shuffle,
         num_workers=0,
         pin_memory=DEVICE.type == "cuda",
@@ -264,9 +264,9 @@ def eer(labels, probs):
     return float((fpr[i] + fnr[i]) / 2)
 
 
-def train_cqcc():
-    name = "CQCC"
-    feature = CQCC_FEATURE
+def train_ffv():
+    name = "FFV"
+    feature = FFV_FEATURE
     model_dir = os.path.join(MODELS_DIR, name)
     os.makedirs(model_dir, exist_ok=True)
     results_path = os.path.join(model_dir, "fold_results.npy")
@@ -278,7 +278,7 @@ def train_cqcc():
     if os.path.exists(results_path):
         try:
             old = list(np.load(results_path, allow_pickle=True))
-            if old and all(r.get("training_version") == CQCC_VERSION for r in old):
+            if old and all(r.get("training_version") == FFV_VERSION for r in old):
                 results = old
                 completed = {int(r["fold"]) for r in old}
         except Exception:
@@ -292,12 +292,12 @@ def train_cqcc():
         train_files, val_files = get_fold_files(files, fold)
         mean, std = compute_feature_stats(train_files, feature)
 
-        train_ds = CQCCDataset(
+        train_ds = FFVDataset(
             train_files, feature, mean, std,
             max_windows=MAX_TRAIN_WINDOWS_PER_FILE,
             seed=SEED + fold,
         )
-        val_ds = CQCCDataset(
+        val_ds = FFVDataset(
             val_files, feature, mean, std,
             max_windows=None,
             seed=SEED + fold,
@@ -307,7 +307,7 @@ def train_cqcc():
         train_loader = make_loader(train_ds, True, gen)
         val_loader = make_loader(val_ds, False)
 
-        model = CQCCMLP(CQCC_DIM).to(DEVICE)
+        model = FFVMLP(FFV_DIM).to(DEVICE)
         optimizer = optim.AdamW(
             model.parameters(),
             lr=LEARNING_RATE,
@@ -326,7 +326,7 @@ def train_cqcc():
         best_path = os.path.join(model_dir, f"best_fold{fold}.pt")
 
         print(f"\n{name} — Fold {fold}")
-        for epoch in range(1, CQCC_MAX_EPOCHS + 1):
+        for epoch in range(1, FFV_MAX_EPOCHS + 1):
             start = time.time()
             loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
             val_loss, val_f1, val_auc = validate(model, val_loader, criterion)
@@ -341,14 +341,14 @@ def train_cqcc():
                 patience += 1
 
             print(
-                f"  Epoch {epoch:02d}/{CQCC_MAX_EPOCHS} "
+                f"  Epoch {epoch:02d}/{FFV_MAX_EPOCHS} "
                 f"TrainLoss {loss:.4f} ValLoss {val_loss:.4f} "
                 f"ClipF1 {val_f1:.4f} AUC {val_auc:.4f} "
-                f"ES {patience}/{CQCC_PATIENCE} "
+                f"ES {patience}/{FFV_PATIENCE} "
                 f"{time.time()-start:.0f}s"
             )
 
-            if patience >= CQCC_PATIENCE:
+            if patience >= FFV_PATIENCE:
                 break
 
         state = torch.load(best_path, map_location=DEVICE, weights_only=True)
@@ -356,7 +356,7 @@ def train_cqcc():
         _, _, val_auc = validate(model, val_loader, criterion)
 
         results.append({
-            "training_version": CQCC_VERSION,
+            "training_version": FFV_VERSION,
             "fold": fold,
             "best_epoch": best_epoch,
             "best_f1": best_f1,
@@ -377,4 +377,4 @@ def train_cqcc():
 
 if __name__ == "__main__":
     set_seed(SEED)
-    train_cqcc()
+    train_ffv()

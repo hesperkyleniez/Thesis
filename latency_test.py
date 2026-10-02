@@ -11,14 +11,15 @@ import torch
 sys.path.insert(0, r"D:\Thesis\code")
 
 from config import MODELS_DIR, SAMPLE_RATE, DROPOUT
-from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0
+from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0, extract_ffv
 from train import CNNOnly, CNNGRUOnly, CNNGRUFusion
-from cqcc_train import CQCC_DIM, CQCCMLP
-from cqcc_fusion import load_fusion_model, fusion_predict_proba, summarize_probabilities
+from cqcc_train import CQCC_DIM, CQCCMLP, CQCC_VERSION
+from ffv_train import FFV_DIM, FFVMLP, FFV_VERSION
+from cqcc_ffv_fusion import load_fusion_model, fusion_predict_proba, summarize_probabilities
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CNN-GRU-CQCC-F")
+MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CNN-GRU-CQCC-FFV-F")
 
 
 def sync():
@@ -40,11 +41,22 @@ def load_cqcc_stats():
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     stats = np.load(path, allow_pickle=True).item()
+    if stats.get("training_version") != CQCC_VERSION:
+        raise RuntimeError(
+            "CQCC final model/stats use an older CQCC definition. "
+            "Run cqcc_train.py then cqcc_retrain.py first."
+        )
     return (
         np.asarray(stats["mean"], dtype=np.float32),
         np.asarray(stats["std"], dtype=np.float32),
     )
 
+
+def load_ffv_stats():
+    path=os.path.join(MODELS_DIR,"FFV","final_norm_stats.npy")
+    stats=np.load(path,allow_pickle=True).item()
+    if stats.get("training_version") != FFV_VERSION: raise RuntimeError("FFV final model/stats incompatible.")
+    return np.asarray(stats["mean"],np.float32),np.asarray(stats["std"],np.float32)
 
 def build_runner(model_name):
     if model_name == "CNN-only":
@@ -89,21 +101,26 @@ def build_runner(model_name):
                 return torch.sigmoid(model(lm, mc, f0t)).item()
         return run
 
-    if model_name == "CNN-GRU-CQCC-F":
+    if model_name == "CNN-GRU-CQCC-FFV-F":
         cnn = load_state(CNNGRUOnly(dropout=0.0).to(DEVICE), "CNN-GRU")
         cqcc = load_state(CQCCMLP(CQCC_DIM).to(DEVICE), "CQCC")
         cqcc_mean, cqcc_std = load_cqcc_stats()
+        ffv = load_state(FFVMLP(FFV_DIM).to(DEVICE), "FFV")
+        ffv_mean, ffv_std = load_ffv_stats()
         fusion = load_fusion_model()
 
         def run(audio):
             logmel = extract_logmel(audio)
             cq = (extract_cqcc(audio) - cqcc_mean) / cqcc_std
+            fv = (extract_ffv(audio) - ffv_mean) / ffv_std
             lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
             cqt = torch.from_numpy(cq.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            fvt = torch.from_numpy(fv.astype(np.float32)).unsqueeze(0).to(DEVICE)
             with torch.inference_mode():
                 p_cnn = torch.sigmoid(cnn(lm, None, None)).item()
                 p_cqcc = torch.sigmoid(cqcc(cqt)).item()
-            x = summarize_probabilities([p_cnn], [p_cqcc]).reshape(1, -1)
+                p_ffv = torch.sigmoid(ffv(fvt)).item()
+            x = summarize_probabilities([p_cnn], [p_cqcc], [p_ffv]).reshape(1, -1)
             return float(fusion_predict_proba(fusion, x)[0])
         return run
 
