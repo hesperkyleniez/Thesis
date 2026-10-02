@@ -1,26 +1,24 @@
-# latency_test.py
-# End-to-end latency benchmark for the v9 primary CNN-GRU pipeline.
-#
-# Default mode benchmarks the primary CNN-GRU model, which is the system's
-# latency-oriented detector. --mode fusion additionally measures prediction
-# fusion with MFCC/CQCC/F0 experts when final checkpoints exist.
+"""Per-window end-to-end latency benchmark for the four retained models."""
 
+import argparse
 import os
 import sys
 import time
-import argparse
+
 import numpy as np
 import torch
 
 sys.path.insert(0, r"D:\Thesis\code")
-from config import (
-    MODELS_DIR, SAMPLE_RATE, N_MELS, N_MFCC, N_FFT, HOP_LENGTH,
-    TARGET_SHAPE, F0_MIN, F0_MAX,
-)
+
+from config import MODELS_DIR, SAMPLE_RATE, DROPOUT
 from features import extract_logmel, extract_mfcc, extract_cqcc, extract_f0
-from train import CNNGRUOnly
+from train import CNNOnly, CNNGRUOnly, CNNGRUFusion
+from cqcc_train import CQCC_DIM, CQCCMLP
+from cqcc_fusion import load_fusion_model, fusion_predict_proba, summarize_probabilities
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CNN-GRU-CQCC-F")
 
 
 def sync():
@@ -28,9 +26,8 @@ def sync():
         torch.cuda.synchronize()
 
 
-def load_cnn():
-    model = CNNGRUOnly(dropout=0.0).to(DEVICE)
-    path = os.path.join(MODELS_DIR, "CNN-GRU", "final_model.pt")
+def load_state(model, folder):
+    path = os.path.join(MODELS_DIR, folder, "final_model.pt")
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     model.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
@@ -38,78 +35,125 @@ def load_cnn():
     return model
 
 
-def benchmark(n_runs=100):
-    model = load_cnn()
-    dummy = np.random.randn(SAMPLE_RATE).astype(np.float32)
+def load_cqcc_stats():
+    path = os.path.join(MODELS_DIR, "CQCC", "final_norm_stats.npy")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    stats = np.load(path, allow_pickle=True).item()
+    return (
+        np.asarray(stats["mean"], dtype=np.float32),
+        np.asarray(stats["std"], dtype=np.float32),
+    )
+
+
+def build_runner(model_name):
+    if model_name == "CNN-only":
+        model = load_state(CNNOnly(dropout=0.0).to(DEVICE), "CNN-only")
+
+        def run(audio):
+            logmel = extract_logmel(audio)
+            lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            with torch.inference_mode():
+                return torch.sigmoid(model(lm)).item()
+        return run
+
+    if model_name == "CNN-GRU":
+        model = load_state(CNNGRUOnly(dropout=0.0).to(DEVICE), "CNN-GRU")
+
+        def run(audio):
+            logmel = extract_logmel(audio)
+            lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            with torch.inference_mode():
+                return torch.sigmoid(model(lm, None, None)).item()
+        return run
+
+    if model_name == "CNN-GRU-F":
+        model = load_state(CNNGRUFusion(dropout=0.0).to(DEVICE), "CNN-GRU-F")
+
+        # Use final normalization stats exactly as evaluation does for MFCC.
+        norm_path = os.path.join(MODELS_DIR, "CNN-GRU-F", "final_norm_stats.npy")
+        stats = np.load(norm_path, allow_pickle=True).item()
+        mfcc_mean = np.asarray(stats["mfcc_mean"], dtype=np.float32)
+        mfcc_std = np.asarray(stats["mfcc_std"], dtype=np.float32)
+        # A single latency window has no speaker-wide F0 context; benchmark the
+        # feature extraction/model compute with the raw pooled F0 vector.
+
+        def run(audio):
+            logmel = extract_logmel(audio)
+            mfcc = (extract_mfcc(audio) - mfcc_mean) / mfcc_std
+            f0 = extract_f0(audio)
+            lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            mc = torch.from_numpy(mfcc.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            f0t = torch.from_numpy(f0.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            with torch.inference_mode():
+                return torch.sigmoid(model(lm, mc, f0t)).item()
+        return run
+
+    if model_name == "CNN-GRU-CQCC-F":
+        cnn = load_state(CNNGRUOnly(dropout=0.0).to(DEVICE), "CNN-GRU")
+        cqcc = load_state(CQCCMLP(CQCC_DIM).to(DEVICE), "CQCC")
+        cqcc_mean, cqcc_std = load_cqcc_stats()
+        fusion = load_fusion_model()
+
+        def run(audio):
+            logmel = extract_logmel(audio)
+            cq = (extract_cqcc(audio) - cqcc_mean) / cqcc_std
+            lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            cqt = torch.from_numpy(cq.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            with torch.inference_mode():
+                p_cnn = torch.sigmoid(cnn(lm, None, None)).item()
+                p_cqcc = torch.sigmoid(cqcc(cqt)).item()
+            x = summarize_probabilities([p_cnn], [p_cqcc]).reshape(1, -1)
+            return float(fusion_predict_proba(fusion, x)[0])
+        return run
+
+    raise ValueError(model_name)
+
+
+def benchmark_one(model_name, n_runs):
+    runner = build_runner(model_name)
+    rng = np.random.default_rng(42)
 
     for _ in range(10):
-        lm = torch.from_numpy(extract_logmel(dummy)).unsqueeze(0).unsqueeze(0).to(DEVICE)
-        mc = torch.from_numpy(extract_mfcc(dummy)).unsqueeze(0).to(DEVICE)
-        f0 = torch.from_numpy(extract_f0(dummy)).unsqueeze(0).to(DEVICE)
-        with torch.no_grad():
-            _ = model(lm, mc, f0)
+        runner(rng.normal(0, 0.1, SAMPLE_RATE).astype(np.float32))
     sync()
 
-    times = {"logmel": [], "mfcc": [], "f0": [], "cnn_inference": [], "total": []}
-
+    times = []
     for _ in range(n_runs):
-        audio = np.random.randn(SAMPLE_RATE).astype(np.float32)
-        t_total = time.perf_counter()
-
-        t = time.perf_counter()
-        logmel = extract_logmel(audio)
-        times["logmel"].append((time.perf_counter() - t) * 1000)
-
-        t = time.perf_counter()
-        mfcc = extract_mfcc(audio)
-        times["mfcc"].append((time.perf_counter() - t) * 1000)
-
-        t = time.perf_counter()
-        f0 = extract_f0(audio)
-        times["f0"].append((time.perf_counter() - t) * 1000)
-
-        lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
-        mc = torch.from_numpy(mfcc).unsqueeze(0).to(DEVICE)
-        f0t = torch.from_numpy(f0).unsqueeze(0).to(DEVICE)
-
+        audio = rng.normal(0, 0.1, SAMPLE_RATE).astype(np.float32)
         sync()
-        t = time.perf_counter()
-        with torch.no_grad():
-            _ = model(lm, mc, f0t)
+        t0 = time.perf_counter()
+        runner(audio)
         sync()
-        times["cnn_inference"].append((time.perf_counter() - t) * 1000)
+        times.append((time.perf_counter() - t0) * 1000.0)
 
-        times["total"].append((time.perf_counter() - t_total) * 1000)
+    values = np.asarray(times)
+    return {
+        "mean_ms": float(np.mean(values)),
+        "std_ms": float(np.std(values)),
+        "p95_ms": float(np.percentile(values, 95)),
+    }
 
-    print("=" * 65)
-    print("V9 LATENCY BENCHMARK — CNN-GRU PRIMARY DETECTOR")
-    print("=" * 65)
-    print(f"{'Step':<24}{'Mean':>10}{'Std':>10}{'95th%':>10}")
-    print("-" * 65)
 
-    for key, label in [
-        ("logmel", "Log-Mel extraction"),
-        ("mfcc", "MFCC extraction"),
-        ("f0", "F0 extraction"),
-        ("cnn_inference", "CNN-GRU inference"),
-        ("total", "TOTAL end-to-end"),
-    ]:
-        vals = np.asarray(times[key])
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=list(MODEL_CHOICES) + ["all"], default="all")
+    parser.add_argument("--runs", type=int, default=100)
+    args = parser.parse_args()
+
+    names = MODEL_CHOICES if args.model == "all" else (args.model,)
+    print(f"Device: {DEVICE}")
+    print(f"Runs per model: {args.runs}")
+    print("100 ms per-window target\n")
+
+    for name in names:
+        result = benchmark_one(name, args.runs)
         print(
-            f"{label:<24}"
-            f"{np.mean(vals):>9.2f}ms"
-            f"{np.std(vals):>9.2f}ms"
-            f"{np.percentile(vals,95):>9.2f}ms"
+            f"{name:<18} mean={result['mean_ms']:.2f} ms  "
+            f"std={result['std_ms']:.2f} ms  p95={result['p95_ms']:.2f} ms  "
+            f"{'MET' if result['p95_ms'] <= 100.0 else 'NOT MET'}"
         )
-
-    p95 = np.percentile(times["total"], 95)
-    print("-" * 65)
-    print(f"95th percentile total: {p95:.2f} ms")
-    print(f"100 ms target       : {'MET' if p95 < 100 else 'NOT MET'}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--runs", type=int, default=100)
-    args = parser.parse_args()
-    benchmark(args.runs)
+    main()

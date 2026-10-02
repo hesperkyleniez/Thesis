@@ -84,6 +84,18 @@ F0_LOG          = True
 
 
 
+
+# ── Degradation parameters ────────────────────────────────────────────────────
+# Kept separate from AUGMENTATION_SPLITS so the assignment proportions never
+# change when degradation strength is tuned. Values follow the current thesis.
+GAUSSIAN_NOISE_STD = 0.003
+URBAN_SNR_DB       = 5.0
+RIR_WET_RATIO      = 0.04
+RIR_MAX_SEC        = 0.10
+# Low-bitrate telephone/VoIP channel variants. The condition assignment remains
+# exactly "telephone"; this only varies the codec inside that assigned condition.
+TELEPHONE_CODEC_MODES = ("gsm", "opus12", "opus16")
+
 # Fixed augmentation conditions assigned once before training
 # 50%   clean
 # 25%   telephone
@@ -122,32 +134,17 @@ DROPOUT       = 0.5
 MAX_TRAIN_WINDOWS_PER_FILE = 6
 MAX_VAL_WINDOWS_PER_FILE   = None
 
-# ── Fusion gate entropy regularization ──────────────────────────────────────────
-# CNNGRUFusion's gate is a softmax over 3 branches (CNN-GRU / MFCC / F0) with no
-# balancing term, which makes it susceptible to "modality laziness" / gate
-# collapse: one branch dominates early and starves the others of gradient
-# signal (Wang, Tran & Feiszli, CVPR 2020, "What Makes Training Multi-modal
-# Classification Networks Hard?"; Peng et al., CVPR 2022, "Balanced Multimodal
-# Learning via On-the-fly Gradient Modulation"; the underlying mechanic is the
-# same one Mixture-of-Experts load-balancing losses exist to prevent, e.g.
-# Shazeer et al. 2017). GATE_ENTROPY_WEIGHT adds a small penalty during
-# training (train.py / retrain.py only, not validation) that discourages the
-# gate from collapsing onto a single branch. 0.0 disables it. Start small
-# (0.01-0.05) and watch get_fusion_weights() move away from a degenerate
-# [~1, ~0, ~0] split across training.
-GATE_ENTROPY_WEIGHT = 0.005
-
 # Final retraining budget policy. The median of the four CV best epochs is used
 # instead of the maximum, which avoids letting one noisy fold determine a long
 # final training run.
 RETRAIN_EPOCH_POLICY = "median"
 
-# Auxiliary prediction-fusion training.
-AUX_BATCH_SIZE = 128
-AUX_HIDDEN = 64
-AUX_DROPOUT = 0.35
-AUX_MAX_EPOCHS = 50
-AUX_PATIENCE = 7
+# CQCC expert used only inside CNN-GRU + CQCC prediction-level late fusion.
+CQCC_BATCH_SIZE = 128
+CQCC_HIDDEN = 64
+CQCC_DROPOUT = 0.35
+CQCC_MAX_EPOCHS = 50
+CQCC_PATIENCE = 7
 
 # ── Labels ──────────────────────────────────────────────────────────────────────
 LABEL_REAL = 0

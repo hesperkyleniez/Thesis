@@ -1,7 +1,6 @@
-# aux_train.py
-# Speaker-grouped 4-fold CV for MFCC, CQCC, and F0 auxiliary classifiers.
-# These models are intentionally independent from the CNN-GRU so their final
-# probabilities can be combined with prediction-level late fusion.
+# cqcc_train.py
+# Speaker-grouped 4-fold CV for the CQCC expert used only by the
+# CNN-GRU + CQCC prediction-level late-fusion model.
 
 import os
 import sys
@@ -20,13 +19,12 @@ from tqdm import tqdm
 sys.path.insert(0, r"D:\Thesis\code")
 from config import (
     FEATURES_DIR, MODELS_DIR, FOLD_ASSIGNMENTS,
-    BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY, DROPOUT, SEED,
-    AUX_BATCH_SIZE, AUX_HIDDEN, AUX_DROPOUT, AUX_MAX_EPOCHS, AUX_PATIENCE,
+    LEARNING_RATE, WEIGHT_DECAY, SEED,
+    CQCC_BATCH_SIZE, CQCC_HIDDEN, CQCC_DROPOUT, CQCC_MAX_EPOCHS, CQCC_PATIENCE,
     LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE,
-    RETRAIN_EPOCH_POLICY,
 )
 
-AUX_VERSION = "v9_prediction_fusion_aux"
+CQCC_VERSION = "v11_cqcc_late_fusion_expert"
 
 
 def set_seed(seed=SEED):
@@ -47,7 +45,7 @@ if torch.cuda.is_available():
     torch.set_float32_matmul_precision("high")
 
 
-class AuxDataset(Dataset):
+class CQCCDataset(Dataset):
     """Loads only one compact auxiliary representation into RAM."""
 
     def __init__(self, files, feature_name, mean, std, max_windows=None, seed=SEED):
@@ -106,8 +104,8 @@ class AuxDataset(Dataset):
         return self.x[idx], self.y[idx], self.paths[idx]
 
 
-class AuxMLP(nn.Module):
-    def __init__(self, input_dim, hidden=AUX_HIDDEN, dropout=AUX_DROPOUT):
+class CQCCMLP(nn.Module):
+    def __init__(self, input_dim, hidden=CQCC_HIDDEN, dropout=CQCC_DROPOUT):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(input_dim),
@@ -124,11 +122,8 @@ class AuxMLP(nn.Module):
         return self.net(x)
 
 
-AUX_SPECS = {
-    "MFCC": {"feature": "mfcc", "dim": 80},
-    "CQCC": {"feature": "cqcc", "dim": 80},
-    "F0": {"feature": "f0", "dim": 2},
-}
+CQCC_FEATURE = "cqcc"
+CQCC_DIM = 80
 
 
 def get_all_train_files():
@@ -170,7 +165,7 @@ def compute_feature_stats(files, feature_name):
 def make_loader(ds, shuffle, generator=None):
     return DataLoader(
         ds,
-        batch_size=AUX_BATCH_SIZE,
+        batch_size=CQCC_BATCH_SIZE,
         shuffle=shuffle,
         num_workers=0,
         pin_memory=DEVICE.type == "cuda",
@@ -268,9 +263,9 @@ def eer(labels, probs):
     return float((fpr[i] + fnr[i]) / 2)
 
 
-def train_aux_model(name):
-    spec = AUX_SPECS[name]
-    feature = spec["feature"]
+def train_cqcc():
+    name = "CQCC"
+    feature = CQCC_FEATURE
     model_dir = os.path.join(MODELS_DIR, name)
     os.makedirs(model_dir, exist_ok=True)
     results_path = os.path.join(model_dir, "fold_results.npy")
@@ -282,7 +277,7 @@ def train_aux_model(name):
     if os.path.exists(results_path):
         try:
             old = list(np.load(results_path, allow_pickle=True))
-            if old and all(r.get("training_version") == AUX_VERSION for r in old):
+            if old and all(r.get("training_version") == CQCC_VERSION for r in old):
                 results = old
                 completed = {int(r["fold"]) for r in old}
         except Exception:
@@ -296,12 +291,12 @@ def train_aux_model(name):
         train_files, val_files = get_fold_files(files, fold)
         mean, std = compute_feature_stats(train_files, feature)
 
-        train_ds = AuxDataset(
+        train_ds = CQCCDataset(
             train_files, feature, mean, std,
             max_windows=MAX_TRAIN_WINDOWS_PER_FILE,
             seed=SEED + fold,
         )
-        val_ds = AuxDataset(
+        val_ds = CQCCDataset(
             val_files, feature, mean, std,
             max_windows=None,
             seed=SEED + fold,
@@ -311,7 +306,7 @@ def train_aux_model(name):
         train_loader = make_loader(train_ds, True, gen)
         val_loader = make_loader(val_ds, False)
 
-        model = AuxMLP(spec["dim"]).to(DEVICE)
+        model = CQCCMLP(CQCC_DIM).to(DEVICE)
         optimizer = optim.AdamW(
             model.parameters(),
             lr=LEARNING_RATE,
@@ -330,7 +325,7 @@ def train_aux_model(name):
         best_path = os.path.join(model_dir, f"best_fold{fold}.pt")
 
         print(f"\n{name} — Fold {fold}")
-        for epoch in range(1, AUX_MAX_EPOCHS + 1):
+        for epoch in range(1, CQCC_MAX_EPOCHS + 1):
             start = time.time()
             loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
             val_loss, val_f1, val_auc = validate(model, val_loader, criterion)
@@ -345,14 +340,14 @@ def train_aux_model(name):
                 patience += 1
 
             print(
-                f"  Epoch {epoch:02d}/{AUX_MAX_EPOCHS} "
+                f"  Epoch {epoch:02d}/{CQCC_MAX_EPOCHS} "
                 f"TrainLoss {loss:.4f} ValLoss {val_loss:.4f} "
                 f"ClipF1 {val_f1:.4f} AUC {val_auc:.4f} "
-                f"ES {patience}/{AUX_PATIENCE} "
+                f"ES {patience}/{CQCC_PATIENCE} "
                 f"{time.time()-start:.0f}s"
             )
 
-            if patience >= AUX_PATIENCE:
+            if patience >= CQCC_PATIENCE:
                 break
 
         state = torch.load(best_path, map_location=DEVICE, weights_only=True)
@@ -360,7 +355,7 @@ def train_aux_model(name):
         _, _, val_auc = validate(model, val_loader, criterion)
 
         results.append({
-            "training_version": AUX_VERSION,
+            "training_version": CQCC_VERSION,
             "fold": fold,
             "best_epoch": best_epoch,
             "best_f1": best_f1,
@@ -380,12 +375,5 @@ def train_aux_model(name):
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=list(AUX_SPECS) + ["all"], default="all")
-    args = parser.parse_args()
-
     set_seed(SEED)
-    names = list(AUX_SPECS) if args.model == "all" else [args.model]
-    for name in names:
-        train_aux_model(name)
+    train_cqcc()

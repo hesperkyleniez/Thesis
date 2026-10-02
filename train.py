@@ -26,14 +26,13 @@ from config import (
     FOLD_ASSIGNMENTS, BATCH_SIZE, LEARNING_RATE,
     WEIGHT_DECAY, MAX_EPOCHS, PATIENCE, LR_FACTOR, DROPOUT, SEED,
     MAX_TRAIN_WINDOWS_PER_FILE, MAX_VAL_WINDOWS_PER_FILE,
-    GATE_ENTROPY_WEIGHT,
 )
 
 
 # -----------------------------------------------------------------------------
 # Reproducibility and device
 # -----------------------------------------------------------------------------
-TRAINING_VERSION = "v9_fusion_matrix_window_cap"
+TRAINING_VERSION = "v11_clean_four_models_robust_telephone"
 
 
 def set_seed(seed=SEED):
@@ -227,57 +226,6 @@ class SpecAugment(nn.Module):
         return x
 
 
-class GaussianFeatureNoise(nn.Module):
-    """
-    Additive Gaussian noise, active only during training (same
-    train-vs-eval gate as SpecAugment above, via nn.Module.training).
-
-    Log-mel goes through SpecAugment every epoch and has to learn
-    patterns robust to missing time/frequency bands. MFCC and F0 get no
-    equivalent perturbation -- they're clean, precise, z-scored numbers
-    every epoch, which makes them the easiest input in the network to
-    memorize a per-recording fingerprint from rather than a
-    generalizable real-vs-AI signal (the features are already
-    z-scored, so std=1 is the input's own natural scale; noise_std is
-    a fraction of that). Equivalent to Tikhonov regularization for
-    small-noise limits (Bishop, 1995, "Training with Noise is
-    Equivalent to Tikhonov Regularization").
-    """
-    def __init__(self, noise_std=0.15):
-        super().__init__()
-        self.noise_std = noise_std
-
-    def forward(self, x):
-        if not self.training or self.noise_std <= 0:
-            return x
-        return x + torch.randn_like(x) * self.noise_std
-
-
-class BranchDropout(nn.Module):
-    """
-    Modality/branch dropout (Neverova et al., 2016, "ModDrop: Adaptive
-    Multi-Modal Gesture Recognition"). During training, independently
-    zero out this branch's *embedding* (post-projection, so LayerNorm
-    upstream never sees an all-zero input) for a random subset of
-    examples in the batch. Unlike GaussianFeatureNoise (which fights
-    memorization of exact values) this fights the classifier/gate
-    co-adapting to always lean on this branch -- forces it to remain
-    correct using the other branches alone some fraction of the time.
-    No-op during eval, same training-gate pattern as the classes above.
-    """
-    def __init__(self, drop_prob=0.3):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x):
-        if not self.training or self.drop_prob <= 0:
-            return x
-        keep_mask = (
-            torch.rand(x.size(0), 1, device=x.device) > self.drop_prob
-        ).float()
-        return x * keep_mask
-
-
 class TemporalCNNGRUEncoder(nn.Module):
     """
     Lightweight temporal encoder.
@@ -393,141 +341,48 @@ class CNNGRUOnly(nn.Module):
         return {}
 
 class CNNGRUFusion(nn.Module):
+    """
+    Thesis feature-fusion model:
+      Log-Mel -> CNN-GRU -> 128-D embedding
+      MFCC -> pooled 80-D vector
+      F0 -> pooled 2-D vector
+
+    The three representations are weighted by independent learnable scalar
+    parameters alpha, beta, and gamma (initialized to 1.0), concatenated, and
+    classified. This matches the current Chapter III methodology.
+    """
     def __init__(self, dropout=0.5):
         super().__init__()
-
         self.encoder = TemporalCNNGRUEncoder(dropout=dropout)
 
-        # See GaussianFeatureNoise above: log-mel gets SpecAugment every
-        # epoch, mfcc/f0 previously got no equivalent train-time
-        # perturbation at all, making them the easiest thing in the
-        # network to memorize a per-file fingerprint from.
-        self.mfcc_noise = GaussianFeatureNoise(noise_std=0.30)
-        self.f0_noise = GaussianFeatureNoise(noise_std=0.30)
-
-        # See BranchDropout above: forces the gate/classifier to stay
-        # correct using CNN-GRU (+ whichever of mfcc/f0 survives) alone
-        # part of the time, instead of co-adapting to always lean on the
-        # weaker branches.
-        self.mfcc_branch_dropout = BranchDropout(drop_prob=0.3)
-        self.f0_branch_dropout = BranchDropout(drop_prob=0.3)
-
-        # Project each branch into a common 64-D representation
-        self.cnn_proj = nn.Sequential(
-            nn.LayerNorm(128),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.40),
-            nn.LayerNorm(64),
-        )
-
-        self.mfcc_proj = nn.Sequential(
-            nn.LayerNorm(80),
-            nn.Linear(80, 64),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.65),
-            nn.LayerNorm(64),
-        )
-
-        # f0 is only 2 raw scalars (mean/std). The old 2->32->64 expansion
-        # gave this branch ~2,200 parameters to fit from almost no real
-        # information, which is a classic overfitting setup: overlapping
-        # windows barely change these two numbers within a file, so the
-        # branch could easily memorize a per-recording fingerprint rather
-        # than a generalizable real-vs-AI signal. Cut the hidden width and
-        # raise dropout to shrink that overfitting surface.
-        self.f0_proj = nn.Sequential(
-            nn.LayerNorm(2),
-            nn.Linear(2, 16),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.60),
-            nn.Linear(16, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-        )
-
-        # Input-conditioned gating
-        self.gate = nn.Sequential(
-            nn.Linear(64 * 3, 32),
-            nn.GELU(),
-            nn.Dropout(0.10),
-            nn.Linear(32, 3),
-        )
+        self.alpha = nn.Parameter(torch.ones(1))
+        self.beta = nn.Parameter(torch.ones(1))
+        self.gamma = nn.Parameter(torch.ones(1))
 
         self.classifier = nn.Sequential(
-            nn.LayerNorm(64 * 3),
-            nn.Linear(64 * 3, 128),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.75),
+            nn.Linear(128 + 80 + 2, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Dropout(dropout * 0.40),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout * 0.6),
             nn.Linear(64, 1),
         )
 
-        self.last_gate_weights = None
-
     def forward(self, logmel, mfcc, f0):
-        # CNN-GRU branch
         cnn_emb = self.encoder(logmel)
-        cnn_emb = self.cnn_proj(cnn_emb)
-
-        # MFCC branch
-        mfcc_emb = self.mfcc_proj(self.mfcc_noise(mfcc))
-        mfcc_emb = self.mfcc_branch_dropout(mfcc_emb)
-
-        # F0 branch
-        f0_emb = self.f0_proj(self.f0_noise(f0))
-        f0_emb = self.f0_branch_dropout(f0_emb)
-
-        # Generate sample-specific branch weights
-        gate_input = torch.cat(
-            [cnn_emb, mfcc_emb, f0_emb],
-            dim=1
-        )
-
-        gate_logits = self.gate(gate_input)
-        gate_weights = torch.softmax(
-            gate_logits / 1.5,
-            dim=1
-        )
-
-        w_cnn = gate_weights[:, 0:1]
-        w_mfcc = gate_weights[:, 1:2]
-        w_f0 = gate_weights[:, 2:3]
-
-        # Weighted late fusion
         fused = torch.cat(
-            [
-                w_cnn * cnn_emb,
-                w_mfcc * mfcc_emb,
-                w_f0 * f0_emb,
-            ],
-            dim=1
+            [self.alpha * cnn_emb, self.beta * mfcc, self.gamma * f0],
+            dim=1,
         )
-
-        # Kept WITH gradient for the entropy regularizer in train_epoch()
-        # (see gate_entropy_penalty). last_gate_weights below stays detached
-        # since it's only used for reporting via get_fusion_weights().
-        self.live_gate_weights = gate_weights
-        self.last_gate_weights = gate_weights.detach()
-
         return self.classifier(fused)
 
     def get_fusion_weights(self):
-        if self.last_gate_weights is None:
-            return {
-                "CNN-GRU": 1 / 3,
-                "MFCC": 1 / 3,
-                "F0": 1 / 3,
-            }
-
-        weights = self.last_gate_weights.mean(dim=0).cpu().numpy()
-
         return {
-            "CNN-GRU": float(weights[0]),
-            "MFCC": float(weights[1]),
-            "F0": float(weights[2]),
+            "alpha (CNN-GRU)": float(self.alpha.detach().cpu().item()),
+            "beta (MFCC)": float(self.beta.detach().cpu().item()),
+            "gamma (F0)": float(self.gamma.detach().cpu().item()),
         }
 
 
@@ -687,79 +542,14 @@ def make_scaler():
         return torch.cuda.amp.GradScaler(enabled=True)
 
 
-def gate_entropy_penalty(model):
-    """
-    Penalizes CNNGRUFusion's gate for collapsing onto a single branch.
-
-    The gate is a softmax over 3 branches with no balancing term, which is
-    exactly the setup that "modality laziness" / gate collapse happens in:
-    whichever branch is easiest to fit early on captures the gate's
-    attention and starves the others of gradient (Wang, Tran & Feiszli,
-    CVPR 2020; Peng et al., CVPR 2022 OGM-GE; same failure mode
-    Mixture-of-Experts load-balancing losses exist to prevent, e.g.
-    Shazeer et al. 2017). This adds -entropy (scaled) to the loss so the
-    optimizer is pushed toward keeping the gate's distribution closer to
-    uniform instead of collapsing it. Returns 0 for models without a gate
-    (CNNOnly, CNNGRUOnly), so this is safe to call unconditionally.
-    """
-    # Must read the non-detached copy -- last_gate_weights is detached
-    # for reporting, so using it here would add a constant with no
-    # gradient and silently do nothing.
-    gate_weights = getattr(model, "live_gate_weights", None)
-    if gate_weights is None or GATE_ENTROPY_WEIGHT == 0.0:
-        return 0.0
-
-    eps = 1e-8
-    entropy = -(gate_weights * torch.log(gate_weights + eps)).sum(dim=1).mean()
-    max_entropy = torch.log(
-        torch.tensor(float(gate_weights.size(1)), device=gate_weights.device)
-    )
-    # 0 when the gate is perfectly balanced, grows as it collapses.
-    return GATE_ENTROPY_WEIGHT * (max_entropy - entropy)
-
-
 def build_optimizer(model, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY):
-    """
-    Standard param-group weight decay (Loshchilov & Hutter, "Decoupled
-    Weight Decay Regularization" / AdamW, ICLR 2019). For CNNGRUFusion,
-    mfcc_proj and f0_proj get several times the base weight decay: they
-    take 80 and 2 raw scalars respectively and have far more parameters
-    relative to that input's actual information content than the CNN-GRU
-    encoder does relative to a full log-mel spectrogram, which is what
-    makes them memorize per-recording quirks fastest (see the overfitting
-    note above CNNGRUFusion.f0_proj). Everything else uses the normal
-    weight_decay. For CNNOnly / CNNGRUOnly this is identical to a single
-    AdamW param group.
-    """
-    strong_decay_params = []
-    normal_decay_params = []
-
-    strong_decay_modules = []
-    if hasattr(model, "mfcc_proj"):
-        strong_decay_modules.append(model.mfcc_proj)
-    if hasattr(model, "f0_proj"):
-        strong_decay_modules.append(model.f0_proj)
-
-    strong_decay_ids = set()
-    for module in strong_decay_modules:
-        for p in module.parameters():
-            strong_decay_ids.add(id(p))
-
-    for p in model.parameters():
-        if not p.requires_grad:
-            continue
-        if id(p) in strong_decay_ids:
-            strong_decay_params.append(p)
-        else:
-            normal_decay_params.append(p)
-
-    param_groups = [{"params": normal_decay_params, "weight_decay": weight_decay}]
-    if strong_decay_params:
-        param_groups.append(
-            {"params": strong_decay_params, "weight_decay": weight_decay * 5.0}
-        )
-
-    return optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999))
+    """AdamW optimizer shared by all three neural architectures."""
+    return optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+        betas=(0.9, 0.999),
+    )
 
 
 def train_epoch(model, loader, optimizer, criterion, scaler):
@@ -780,7 +570,6 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(logmel, mfcc, f0)
                 loss = criterion(logits, labels)
-                loss = loss + gate_entropy_penalty(model)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -789,7 +578,6 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
         else:
             logits = model(logmel, mfcc, f0)
             loss = criterion(logits, labels)
-            loss = loss + gate_entropy_penalty(model)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()

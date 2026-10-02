@@ -47,7 +47,6 @@ from train import (
     collate_with_paths,
     set_seed,
     USE_AMP,
-    gate_entropy_penalty,
     build_optimizer,
     compute_fold_norm_stats,
     TRAINING_VERSION,
@@ -165,7 +164,6 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(logmel, mfcc, f0)
                 loss = criterion(logits, labels)
-                loss = loss + gate_entropy_penalty(model)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -175,7 +173,6 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
         else:
             logits = model(logmel, mfcc, f0)
             loss = criterion(logits, labels)
-            loss = loss + gate_entropy_penalty(model)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
             optimizer.step()

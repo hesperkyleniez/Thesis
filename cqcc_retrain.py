@@ -1,6 +1,5 @@
-# aux_retrain.py
-# Final retraining for MFCC/CQCC/F0 auxiliary models.
-# Uses the median best epoch across the four speaker-grouped CV folds.
+# cqcc_retrain.py
+# Final retraining for the CQCC expert used by CNN-GRU + CQCC late fusion.
 
 import os
 import sys
@@ -15,12 +14,12 @@ from tqdm import tqdm
 
 sys.path.insert(0, r"D:\Thesis\code")
 from config import (
-    FEATURES_DIR, MODELS_DIR, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
+    FEATURES_DIR, MODELS_DIR, LEARNING_RATE, WEIGHT_DECAY,
     SEED, LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE, RETRAIN_EPOCH_POLICY,
-    AUX_BATCH_SIZE, AUX_HIDDEN, AUX_DROPOUT,
+    CQCC_BATCH_SIZE, CQCC_HIDDEN, CQCC_DROPOUT,
 )
-from aux_train import (
-    AUX_SPECS, AUX_VERSION, AuxDataset, AuxMLP,
+from cqcc_train import (
+    CQCC_FEATURE, CQCC_DIM, CQCC_VERSION, CQCCDataset, CQCCMLP,
     get_all_train_files, make_loader, make_scaler, train_epoch,
     DEVICE, USE_AMP,
 )
@@ -49,9 +48,9 @@ def get_target_epoch(name):
     return target
 
 
-def retrain(name):
-    spec = AUX_SPECS[name]
-    feature = spec["feature"]
+def retrain_cqcc():
+    name = "CQCC"
+    feature = CQCC_FEATURE
     model_dir = os.path.join(MODELS_DIR, name)
     os.makedirs(model_dir, exist_ok=True)
 
@@ -71,21 +70,21 @@ def retrain(name):
     np.save(norm_path, {
         "mean": mean,
         "std": std,
-        "training_version": AUX_VERSION,
+        "training_version": CQCC_VERSION,
         "feature": feature,
     })
 
-    ds = AuxDataset(
+    ds = CQCCDataset(
         files, feature, mean, std,
         max_windows=MAX_TRAIN_WINDOWS_PER_FILE,
         seed=SEED,
     )
     loader = DataLoader(
-        ds, batch_size=AUX_BATCH_SIZE, shuffle=True, num_workers=0,
+        ds, batch_size=CQCC_BATCH_SIZE, shuffle=True, num_workers=0,
         pin_memory=DEVICE.type == "cuda",
     )
 
-    model = AuxMLP(spec["dim"], AUX_HIDDEN, AUX_DROPOUT).to(DEVICE)
+    model = CQCCMLP(CQCC_DIM, CQCC_HIDDEN, CQCC_DROPOUT).to(DEVICE)
     optimizer = optim.AdamW(
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
@@ -124,11 +123,4 @@ def retrain(name):
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=list(AUX_SPECS) + ["all"], default="all")
-    args = parser.parse_args()
-
-    names = list(AUX_SPECS) if args.model == "all" else [args.model]
-    for name in names:
-        retrain(name)
+    retrain_cqcc()
