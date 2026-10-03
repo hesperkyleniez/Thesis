@@ -99,3 +99,31 @@ The optimized features intentionally use a new cache version because CQCC densit
 - de Cheveigne & Kawahara (2002): YIN F0 estimator.
 
 Performance is still an empirical question. The code therefore keeps speaker-disjoint CV, clean held-out evaluation, degraded held-out evaluation, per-condition degraded metrics, and latency measurement rather than assuming that a feature change must improve F1.
+
+## Prediction-level fusion experiment (corrected)
+
+The controlled comparison is:
+
+- CNN-GRU + CQCC + FFV -> OOF prediction-level logistic fusion
+- CNN-GRU + CQCC + F0  -> OOF prediction-level logistic fusion
+
+Run in this order:
+
+```bash
+python prepare_dataset.py
+python run_degraded_test.py
+python train.py --model CNN-GRU
+python retrain.py --model CNN-GRU
+python cqcc_train.py
+python cqcc_retrain.py
+python ffv_train.py
+python ffv_retrain.py
+python f0_train.py
+python f0_retrain.py
+python cqcc_ffv_fusion.py
+python cqcc_f0_fusion.py
+python latency_test.py --model CNN-GRU-CQCC-FFV-F
+python latency_test.py --model CNN-GRU-CQCC-F0-F
+```
+
+`cqcc_aux_models.py` is not part of the final prediction-fusion comparison; it is retained only as an earlier feature/embedding-fusion experiment.

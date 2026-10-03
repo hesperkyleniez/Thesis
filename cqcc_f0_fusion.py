@@ -1,10 +1,10 @@
-# cqcc_ffv_fusion.py
-# CNN-GRU + CQCC + FFV prediction-level late fusion.
+# cqcc_f0_fusion.py
+# CNN-GRU + CQCC + F0 prediction-level late fusion.
 #
 # Independent experts:
 #   Log-Mel -> CNN-GRU -> window probabilities
 #   CQCC    -> CQCC MLP -> window probabilities
-#   FFV     -> FFV MLP -> window probabilities
+#   F0      -> F0 MLP -> window probabilities
 # The fusion classifier is trained only from speaker-grouped OOF predictions.
 # Both clean and degraded evaluation use the thesis decision threshold 0.50.
 
@@ -34,16 +34,16 @@ sys.path.insert(0, r"D:\Thesis\code")
 from config import FEATURES_DIR, MODELS_DIR, RESULTS_DIR, FOLD_ASSIGNMENTS, SEED
 from train import CNNGRUOnly, set_seed
 from cqcc_train import CQCC_DIM, CQCCMLP, CQCC_VERSION
-from ffv_train import FFV_DIM, FFVMLP, FFV_VERSION
+from f0_train import F0_DIM, F0MLP, F0_VERSION
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VERSION = "v14_cnn_gru_cqcc_ffv_oof_late_fusion"
+VERSION = "v14_cnn_gru_cqcc_f0_oof_late_fusion"
 OOF_CACHE_VERSION = VERSION
-FUSION_NAME = "CNN-GRU-CQCC-FFV-F"
+FUSION_NAME = "CNN-GRU-CQCC-F0-F"
 MODEL_DIR = os.path.join(MODELS_DIR, "Prediction-Fusion", FUSION_NAME)
 MODEL_PATH = os.path.join(MODEL_DIR, "fusion_model.npy")
-RESULT_PATH = os.path.join(RESULTS_DIR, "cnn_gru_cqcc_ffv_fusion_results.npy")
+RESULT_PATH = os.path.join(RESULTS_DIR, "cnn_gru_cqcc_f0_fusion_results.npy")
 OOF_CACHE_PATH = os.path.join(MODEL_DIR, "oof_predictions.npy")
 
 # Small regularization search. Selection is speaker-grouped at the meta level.
@@ -55,7 +55,7 @@ DECISION_THRESHOLD = 0.50
 # Inference batch sizes. These affect speed only, not methodology.
 CNN_BATCH_SIZE = 256
 CQCC_BATCH_SIZE = 512
-FFV_BATCH_SIZE = 512
+F0_BATCH_SIZE = 512
 
 
 # -----------------------------------------------------------------------------
@@ -142,21 +142,21 @@ def load_cqcc_final_stats():
 
 
 
-def load_ffv_fold_stats(fold):
-    path = os.path.join(MODELS_DIR, "FFV", "fold_results.npy")
+def load_f0_fold_stats(fold):
+    path = os.path.join(MODELS_DIR, "F0", "fold_results.npy")
     results = list(np.load(path, allow_pickle=True))
-    if not results or not all(r.get("training_version") == FFV_VERSION for r in results):
-        raise RuntimeError("FFV fold results are incompatible. Run: python ffv_train.py")
+    if not results or not all(r.get("training_version") == F0_VERSION for r in results):
+        raise RuntimeError("F0 fold results are incompatible. Run: python f0_train.py")
     for r in results:
         if int(r["fold"]) == int(fold):
             return np.asarray(r["mean"], np.float32), np.asarray(r["std"], np.float32)
-    raise ValueError(f"FFV fold {fold} normalization stats not found.")
+    raise ValueError(f"F0 fold {fold} normalization stats not found.")
 
-def load_ffv_final_stats():
-    path=os.path.join(MODELS_DIR,"FFV","final_norm_stats.npy")
+def load_f0_final_stats():
+    path=os.path.join(MODELS_DIR,"F0","final_norm_stats.npy")
     d=np.load(path,allow_pickle=True).item()
-    if d.get("training_version") != FFV_VERSION:
-        raise RuntimeError("FFV final model/stats are incompatible. Run: python ffv_retrain.py")
+    if d.get("training_version") != F0_VERSION:
+        raise RuntimeError("F0 final model/stats are incompatible. Run: python f0_retrain.py")
     return np.asarray(d["mean"],np.float32),np.asarray(d["std"],np.float32)
 
 # -----------------------------------------------------------------------------
@@ -256,8 +256,8 @@ def predict_cqcc_windows(model, files, mean, std):
 
     return out
 
-def predict_ffv_windows(model, files, mean, std):
-    """Window-level FFV auxiliary probabilities."""
+def predict_f0_windows(model, files, mean, std):
+    """Window-level F0 auxiliary probabilities."""
     model.eval()
     out = {}
 
@@ -265,10 +265,10 @@ def predict_ffv_windows(model, files, mean, std):
     std_t = torch.as_tensor(std, dtype=torch.float32, device=DEVICE)
 
     with torch.inference_mode():
-        for path in tqdm(files, desc="FFV predictions", leave=False):
+        for path in tqdm(files, desc="F0 predictions", leave=False):
             with np.load(path, allow_pickle=True) as d:
                 x = (
-                    torch.as_tensor(d["ffv"], dtype=torch.float32, device=DEVICE)
+                    torch.as_tensor(d["f0"], dtype=torch.float32, device=DEVICE)
                     - mean_t
                 ) / std_t
                 label = int(d["label"])
@@ -279,8 +279,8 @@ def predict_ffv_windows(model, files, mean, std):
                 )
 
             probs = []
-            for i in range(0, len(x), FFV_BATCH_SIZE):
-                logits = model(x[i:i + FFV_BATCH_SIZE])
+            for i in range(0, len(x), F0_BATCH_SIZE):
+                logits = model(x[i:i + F0_BATCH_SIZE])
                 probs.extend(
                     torch.sigmoid(logits)
                     .float()
@@ -301,22 +301,22 @@ def predict_ffv_windows(model, files, mean, std):
 
 
 def collect_expert_predictions(files, fold=None, final=False):
-    """Independent CNN-GRU, CQCC, and FFV probabilities for late fusion."""
+    """Independent CNN-GRU, CQCC, and F0 probabilities for late fusion."""
     cnn=CNNGRUOnly(dropout=0.0).to(DEVICE); cnn.load_state_dict(load_state("CNN-GRU",fold=fold,final=final))
     cqcc=CQCCMLP(CQCC_DIM).to(DEVICE); cqcc.load_state_dict(load_state("CQCC",fold=fold,final=final))
-    ffv=FFVMLP(FFV_DIM).to(DEVICE); ffv.load_state_dict(load_state("FFV",fold=fold,final=final))
+    f0=F0MLP(F0_DIM).to(DEVICE); f0.load_state_dict(load_state("F0",fold=fold,final=final))
     if final:
-        cm,cs=load_cqcc_final_stats(); fm,fs=load_ffv_final_stats()
+        cm,cs=load_cqcc_final_stats(); fm,fs=load_f0_final_stats()
     else:
-        cm,cs=load_cqcc_fold_stats(fold); fm,fs=load_ffv_fold_stats(fold)
-    a=predict_cnn_windows(cnn,files); b=predict_cqcc_windows(cqcc,files,cm,cs); c=predict_ffv_windows(ffv,files,fm,fs)
-    del cnn,cqcc,ffv
+        cm,cs=load_cqcc_fold_stats(fold); fm,fs=load_f0_fold_stats(fold)
+    a=predict_cnn_windows(cnn,files); b=predict_cqcc_windows(cqcc,files,cm,cs); c=predict_f0_windows(f0,files,fm,fs)
+    del cnn,cqcc,f0
     common=sorted(set(a)&set(b)&set(c)); records=[]
     if len(common)!=len(files): raise RuntimeError("Missing paired expert predictions.")
     for path in common:
         pa,pb,pc=a[path]["window_probs"],b[path]["window_probs"],c[path]["window_probs"]
         if not (len(pa)==len(pb)==len(pc)): raise RuntimeError(f"Window-count mismatch: {path}")
-        records.append({"path":path,"speaker":a[path]["speaker"],"condition":a[path]["condition"],"label":int(a[path]["label"]),"cnn_probs":pa,"cqcc_probs":pb,"ffv_probs":pc})
+        records.append({"path":path,"speaker":a[path]["speaker"],"condition":a[path]["condition"],"label":int(a[path]["label"]),"cnn_probs":pa,"cqcc_probs":pb,"f0_probs":pc})
     return records
 
 
@@ -326,14 +326,14 @@ def collect_expert_predictions(files, fold=None, final=False):
 FEATURE_NAMES = [
  "cnn_mean","cnn_median","cnn_q75","cnn_std","cnn_ai_fraction",
  "cqcc_mean","cqcc_median","cqcc_q75","cqcc_std","cqcc_ai_fraction",
- "ffv_mean","ffv_median","ffv_q75","ffv_std","ffv_ai_fraction",
- "cnn_cqcc_disagreement","cnn_ffv_disagreement","cqcc_ffv_disagreement",
+ "f0_mean","f0_median","f0_q75","f0_std","f0_ai_fraction",
+ "cnn_cqcc_disagreement","cnn_f0_disagreement","cqcc_f0_disagreement",
  "three_way_agreement","mean_expert_probability"
 ]
 
 
-def summarize_probabilities(cnn_probs,cqcc_probs,ffv_probs):
-    arr=[np.asarray(x,dtype=np.float64) for x in (cnn_probs,cqcc_probs,ffv_probs)]
+def summarize_probabilities(cnn_probs,cqcc_probs,f0_probs):
+    arr=[np.asarray(x,dtype=np.float64) for x in (cnn_probs,cqcc_probs,f0_probs)]
     if any(len(x)==0 for x in arr) or len({len(x) for x in arr})!=1: raise ValueError("Expert windows must align.")
     feats=[]
     for x in arr: feats += [float(np.mean(x)),float(np.median(x)),float(np.quantile(x,.75)),float(np.std(x)),float(np.mean(x>=.5))]
@@ -344,7 +344,7 @@ def summarize_probabilities(cnn_probs,cqcc_probs,ffv_probs):
 
 def records_to_matrix(records):
     x = np.stack([
-        summarize_probabilities(r["cnn_probs"], r["cqcc_probs"], r["ffv_probs"])
+        summarize_probabilities(r["cnn_probs"], r["cqcc_probs"], r["f0_probs"])
         for r in records
     ])
     y = np.asarray([r["label"] for r in records], dtype=int)
@@ -536,7 +536,7 @@ def load_fusion_model():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Missing fusion model: {MODEL_PATH}\n"
-            "Run: python cqcc_ffv_fusion.py --fit-only"
+            "Run: python cqcc_f0_fusion.py --fit-only"
         )
     artifact = np.load(MODEL_PATH, allow_pickle=True).item()
     if artifact.get("version") != VERSION:
@@ -643,7 +643,7 @@ def evaluate_split(split, artifact):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "OOF-trained prediction-level late fusion of CNN-GRU Log-Mel, CQCC, and FFV."
+            "OOF-trained prediction-level late fusion of CNN-GRU Log-Mel, CQCC, and F0."
         )
     )
     parser.add_argument(
@@ -676,7 +676,7 @@ def main():
     print(f"Version: {VERSION}")
     print("Architecture: Log-Mel -> CNN-GRU -> probability")
     print("              CQCC    -> Aux MLP -> probability")
-    print("              FFV     -> Aux MLP -> probability")
+    print("              F0      -> Aux MLP -> probability")
     print("              OOF logistic late fusion -> final probability")
     print("Decision threshold: 0.50 for both clean and degraded evaluation.")
 
@@ -695,7 +695,7 @@ def main():
     ]
 
     np.save(RESULT_PATH, results, allow_pickle=True)
-    print(f"\nSaved CNN-GRU + CQCC + FFV fusion results: {RESULT_PATH}")
+    print(f"\nSaved CNN-GRU + CQCC + F0 fusion results: {RESULT_PATH}")
 
 
 if __name__ == "__main__":

@@ -183,6 +183,14 @@ FFV_DROPOUT = 0.35
 FFV_MAX_EPOCHS = 50
 FFV_PATIENCE = 7
 
+# F0 expert used only inside CNN-GRU + CQCC + F0 prediction-level late fusion.
+# Kept capacity/training budget matched to FFV for a controlled comparison.
+F0_BATCH_SIZE = 128
+F0_HIDDEN = 64
+F0_DROPOUT = 0.35
+F0_MAX_EPOCHS = 50
+F0_PATIENCE = 7
+
 # ── CQCC auxiliary-pair models ────────────────────────────────────────────────
 AUX_PAIR_BATCH_SIZE = 256
 AUX_PAIR_HIDDEN = 64
