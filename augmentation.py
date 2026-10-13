@@ -19,7 +19,7 @@ from scipy.signal import fftconvolve, butter, sosfiltfilt, resample_poly
 
 from config import (
     SAMPLE_RATE, OPENSLR_DIR, AIR_DIR, URBANSOUND_DIR, RESOURCES_DIR,
-    URBAN_SNR_DB, GAUSSIAN_NOISE_STD, RIR_WET_RATIO, RIR_MAX_SEC,
+    URBAN_SNR_DB, URBAN_TRAIN_SNR_DB, GAUSSIAN_NOISE_STD, RIR_WET_RATIO, RIR_MAX_SEC,
     TELEPHONE_CODEC_MODES,
 )
 
@@ -91,16 +91,60 @@ def apply_gaussian_noise(audio, rng):
     return (np.asarray(audio, dtype=np.float32) + noise).astype(np.float32)
 
 
-def apply_urban_noise(audio, urban_files, rng, snr_db=URBAN_SNR_DB):
+def _speech_active_power(audio):
+    """Estimate speech power from active frames instead of long pauses.
+
+    A relative energy gate keeps this inexpensive and avoids using labels or any
+    test information.  It is used only for development augmentation.
+    """
+    x = np.ascontiguousarray(audio, dtype=np.float32)
+    if len(x) == 0:
+        return 1e-8
+    frame = max(1, int(0.025 * SAMPLE_RATE))
+    hop = max(1, int(0.010 * SAMPLE_RATE))
+    if len(x) < frame:
+        return float(np.mean(x * x)) + 1e-8
+    # Vectorized frame RMS.  30 dB below the maximum frame energy is treated
+    # as inactive; fall back to whole-clip power if nothing survives.
+    n = 1 + (len(x) - frame) // hop
+    shape = (n, frame)
+    strides = (x.strides[0] * hop, x.strides[0])
+    frames = np.lib.stride_tricks.as_strided(x, shape=shape, strides=strides)
+    power = np.mean(frames * frames, axis=1)
+    threshold = float(np.max(power)) * 1e-3
+    active = power[power >= threshold]
+    return float(np.mean(active if len(active) else power)) + 1e-8
+
+
+def _noise_segment(noise, target_len, rng, random_crop):
+    noise = np.asarray(noise, dtype=np.float32)
+    if len(noise) == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if len(noise) < target_len:
+        noise = np.tile(noise, int(np.ceil(target_len / len(noise))))
+    if random_crop and len(noise) > target_len:
+        start = rng.randrange(0, len(noise) - target_len + 1)
+    else:
+        # Preserve the original held-out test realization exactly.
+        start = 0
+    return noise[start:start + target_len]
+
+
+def apply_urban_noise(audio, urban_files, rng, snr_db=URBAN_SNR_DB, training=False):
     noise_path = _choice(urban_files, rng)
     if noise_path is None:
         return np.asarray(audio, dtype=np.float32)
-    noise = _load_audio_cached(noise_path)
     audio = np.asarray(audio, dtype=np.float32)
-    if len(noise) < len(audio):
-        noise = np.tile(noise, int(np.ceil(len(audio) / max(len(noise), 1))))
-    noise = noise[:len(audio)]
-    p_signal = float(np.mean(audio**2)) + 1e-8
+    noise = _noise_segment(_load_audio_cached(noise_path), len(audio), rng, random_crop=training)
+
+    # Training sees several realistic SNRs; held-out evaluation remains the
+    # original fixed 5 dB protocol for an apples-to-apples comparison.
+    if training:
+        snr_db = float(_choice(list(URBAN_TRAIN_SNR_DB), rng))
+        p_signal = _speech_active_power(audio)
+    else:
+        p_signal = float(np.mean(audio**2)) + 1e-8
+
     p_noise = float(np.mean(noise**2)) + 1e-8
     scale = np.sqrt(p_signal / (p_noise * (10.0 ** (snr_db / 10.0))))
     return peak_normalize(audio + noise * scale)
@@ -214,7 +258,7 @@ def apply_volume_scaling(audio, rng):
     return (np.asarray(audio, dtype=np.float32) * rng.uniform(0.8, 1.2)).astype(np.float32)
 
 
-def apply_augmentation(audio, condition, room_rirs, mobile_rirs, urban_files, rng=None):
+def apply_augmentation(audio, condition, room_rirs, mobile_rirs, urban_files, rng=None, training=False):
     """Apply one fixed thesis degradation condition; proportions are untouched."""
     rng = rng or random
     audio = np.asarray(audio, dtype=np.float32)
@@ -227,9 +271,9 @@ def apply_augmentation(audio, condition, room_rirs, mobile_rirs, urban_files, rn
     elif condition == "mobile_gaussian":
         out = apply_rir(apply_gaussian_noise(audio, rng), mobile_rirs, rng)
     elif condition == "mobile_urban":
-        out = apply_rir(apply_urban_noise(audio, urban_files, rng), mobile_rirs, rng)
+        out = apply_rir(apply_urban_noise(audio, urban_files, rng, training=training), mobile_rirs, rng)
     elif condition == "room_urban":
-        out = apply_rir(apply_urban_noise(audio, urban_files, rng), room_rirs, rng)
+        out = apply_rir(apply_urban_noise(audio, urban_files, rng, training=training), room_rirs, rng)
     else:
         raise ValueError(f"Unknown augmentation condition: {condition}")
     return apply_volume_scaling(peak_normalize(out), rng)

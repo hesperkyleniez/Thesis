@@ -5,7 +5,7 @@
 #   Log-Mel -> CNN-GRU -> window probabilities
 #   CQCC    -> CQCC MLP -> window probabilities
 # The fusion classifier is trained only from speaker-grouped OOF predictions.
-# Both clean and degraded evaluation use the thesis decision threshold 0.50.
+# One global threshold is selected from cross-fitted development predictions only, then locked for held-out evaluation.
 
 import os
 import sys
@@ -32,11 +32,12 @@ sys.path.insert(0, r"D:\Thesis\code")
 
 from config import FEATURES_DIR, MODELS_DIR, RESULTS_DIR, FOLD_ASSIGNMENTS, SEED
 from train import CNNGRUOnly, set_seed
-from cqcc_train import CQCC_DIM, CQCCMLP
+from robustness import condition_balanced_weights, choose_condition_balanced_threshold
+from cqcc_train import CQCC_DIM, CQCCMLP, CQCC_VERSION
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VERSION = "v14_cnn_gru_cqcc_b12_oof_late_fusion"
+VERSION = "v16_robust_all_cnn_gru_cqcc"
 OOF_CACHE_VERSION = VERSION
 FUSION_NAME = "CNN-GRU-CQCC-F"
 MODEL_DIR = os.path.join(MODELS_DIR, "Prediction-Fusion", FUSION_NAME)
@@ -47,7 +48,7 @@ OOF_CACHE_PATH = os.path.join(MODEL_DIR, "oof_predictions.npy")
 # Small regularization search. Selection is speaker-grouped at the meta level.
 C_GRID = (0.01, 0.1, 1.0, 10.0, 100.0)
 
-# Chapter III uses a fixed 0.50 decision threshold for all evaluations.
+# 0.50 is only a safe fallback for legacy artifacts; current v16 artifacts store the OOF-selected threshold.
 DECISION_THRESHOLD = 0.50
 
 # Inference batch sizes. These affect speed only, not methodology.
@@ -108,6 +109,11 @@ def load_cqcc_fold_stats(fold):
         raise FileNotFoundError(path)
 
     results = list(np.load(path, allow_pickle=True))
+    if not results or not all(r.get("training_version") == CQCC_VERSION for r in results):
+        raise RuntimeError(
+            "CQCC fold results are from an older feature/training version. "
+            "Run: python cqcc_train.py"
+        )
     for result in results:
         if int(result["fold"]) == int(fold):
             return (
@@ -122,6 +128,11 @@ def load_cqcc_final_stats():
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     d = np.load(path, allow_pickle=True).item()
+    if d.get("training_version") != CQCC_VERSION:
+        raise RuntimeError(
+            "CQCC final normalization stats are from an older version. "
+            "Run: python cqcc_retrain.py"
+        )
     return (
         np.asarray(d["mean"], dtype=np.float32),
         np.asarray(d["std"], dtype=np.float32),
@@ -402,7 +413,7 @@ def collect_oof_predictions(rebuild_cache=False):
     return records
 
 
-def choose_regularization(x, y, groups):
+def choose_regularization(x, y, groups, conditions):
     unique_groups = np.unique(groups)
     n_splits = min(4, len(unique_groups))
     if n_splits < 2:
@@ -412,57 +423,42 @@ def choose_regularization(x, y, groups):
     best_c = None
     best_loss = float("inf")
 
-    print("\nSelecting fusion regularization with speaker-grouped meta CV...")
+    print("\nSelecting fusion regularization with speaker-grouped, condition-balanced meta CV...")
     for c in C_GRID:
         fold_losses = []
         for train_idx, val_idx in splitter.split(x, y, groups):
             scaler = StandardScaler()
             x_train = scaler.fit_transform(x[train_idx])
             x_val = scaler.transform(x[val_idx])
-
-            clf = LogisticRegression(
-                C=c,
-                solver="lbfgs",
-                max_iter=5000,
-                random_state=SEED,
-            )
-            clf.fit(x_train, y[train_idx])
-            p = clf.predict_proba(x_val)[:, 1]
-            fold_losses.append(
-                log_loss(y[val_idx], np.clip(p, 1e-6, 1 - 1e-6), labels=[0, 1])
-            )
-
+            clf = LogisticRegression(C=c, solver="lbfgs", max_iter=5000, random_state=SEED)
+            train_w = condition_balanced_weights(conditions[train_idx])
+            val_w = condition_balanced_weights(conditions[val_idx])
+            clf.fit(x_train, y[train_idx], sample_weight=train_w)
+            prob = clf.predict_proba(x_val)[:, 1]
+            fold_losses.append(log_loss(
+                y[val_idx], np.clip(prob, 1e-6, 1 - 1e-6), labels=[0, 1], sample_weight=val_w
+            ))
         mean_loss = float(np.mean(fold_losses))
-        print(f"  C={c:<6g} grouped log-loss={mean_loss:.6f}")
+        print(f"  C={c:<6g} grouped balanced log-loss={mean_loss:.6f}")
         if mean_loss < best_loss:
-            best_loss = mean_loss
-            best_c = float(c)
-
-    print(f"Selected C={best_c:g} (grouped log-loss={best_loss:.6f})")
+            best_loss, best_c = mean_loss, float(c)
+    print(f"Selected C={best_c:g} (grouped balanced log-loss={best_loss:.6f})")
     return best_c
 
 
-def cross_fitted_meta_probabilities(x, y, groups, c):
+def cross_fitted_meta_probabilities(x, y, groups, conditions, c):
     unique_groups = np.unique(groups)
     n_splits = min(4, len(unique_groups))
     splitter = GroupKFold(n_splits=n_splits)
-
     probs = np.full(len(y), np.nan, dtype=np.float64)
-
     for train_idx, val_idx in splitter.split(x, y, groups):
         scaler = StandardScaler()
         x_train = scaler.fit_transform(x[train_idx])
         x_val = scaler.transform(x[val_idx])
-
-        clf = LogisticRegression(
-            C=c,
-            solver="lbfgs",
-            max_iter=5000,
-            random_state=SEED,
-        )
-        clf.fit(x_train, y[train_idx])
+        clf = LogisticRegression(C=c, solver="lbfgs", max_iter=5000, random_state=SEED)
+        train_w = condition_balanced_weights(conditions[train_idx])
+        clf.fit(x_train, y[train_idx], sample_weight=train_w)
         probs[val_idx] = clf.predict_proba(x_val)[:, 1]
-
     if np.isnan(probs).any():
         raise RuntimeError("Meta-level cross-fitting did not produce every OOF probability.")
     return probs
@@ -470,33 +466,24 @@ def cross_fitted_meta_probabilities(x, y, groups, c):
 
 def fit_fusion_model(records):
     x, y, groups, conditions, _ = records_to_matrix(records)
-
-    best_c = choose_regularization(x, y, groups)
-    meta_oof_probs = cross_fitted_meta_probabilities(x, y, groups, best_c)
+    best_c = choose_regularization(x, y, groups, conditions)
+    meta_oof_probs = cross_fitted_meta_probabilities(x, y, groups, conditions, best_c)
+    tuned_threshold, threshold_macro_f1, threshold_overall_f1 = choose_condition_balanced_threshold(
+        y, meta_oof_probs, conditions
+    )
 
     scaler = StandardScaler()
     x_scaled = scaler.fit_transform(x)
-    clf = LogisticRegression(
-        C=best_c,
-        solver="lbfgs",
-        max_iter=5000,
-        random_state=SEED,
-    )
-    clf.fit(x_scaled, y)
+    clf = LogisticRegression(C=best_c, solver="lbfgs", max_iter=5000, random_state=SEED)
+    fusion_weights = condition_balanced_weights(conditions)
+    clf.fit(x_scaled, y, sample_weight=fusion_weights)
 
     clean_mask = np.asarray([str(c) == "clean" for c in conditions], dtype=bool)
     degraded_mask = ~clean_mask
-
     def subset_f1(mask):
         if mask.sum() == 0:
             return None
-        return float(
-            f1_score(
-                y[mask],
-                (meta_oof_probs[mask] >= DECISION_THRESHOLD).astype(int),
-                zero_division=0,
-            )
-        )
+        return float(f1_score(y[mask], (meta_oof_probs[mask] >= tuned_threshold).astype(int), zero_division=0))
 
     artifact = {
         "version": VERSION,
@@ -507,29 +494,30 @@ def fit_fusion_model(records):
         "scaler_scale": scaler.scale_.astype(np.float64),
         "coef": clf.coef_.reshape(-1).astype(np.float64),
         "intercept": float(clf.intercept_[0]),
-        "threshold": DECISION_THRESHOLD,
+        "threshold": tuned_threshold,
+        "threshold_macro_condition_f1": threshold_macro_f1,
+        "threshold_overall_f1": threshold_overall_f1,
         "meta_oof_clean_f1": subset_f1(clean_mask),
         "meta_oof_degraded_f1": subset_f1(degraded_mask),
         "n_oof_clips": int(len(y)),
         "n_oof_clean": int(clean_mask.sum()),
         "n_oof_degraded": int(degraded_mask.sum()),
     }
-
     os.makedirs(MODEL_DIR, exist_ok=True)
     np.save(MODEL_PATH, artifact, allow_pickle=True)
-
     print("\nFusion model fitted from OOF development predictions only.")
     print(f"  OOF clips      : {len(y):,}")
     print(f"  OOF clean      : {clean_mask.sum():,}")
     print(f"  OOF degraded   : {degraded_mask.sum():,}")
-    print(f"  Threshold      : {DECISION_THRESHOLD:.2f} (fixed)")
+    print(f"  OOF threshold  : {tuned_threshold:.3f} (condition-macro F1 selected)")
+    print(f"  OOF macro F1   : {threshold_macro_f1:.4f}")
+    print(f"  OOF overall F1 : {threshold_overall_f1:.4f}")
     if artifact["meta_oof_clean_f1"] is not None:
         print(f"  OOF clean F1   : {artifact['meta_oof_clean_f1']:.4f}")
     if artifact["meta_oof_degraded_f1"] is not None:
         print(f"  OOF degraded F1: {artifact['meta_oof_degraded_f1']:.4f}")
     print(f"  Saved          : {MODEL_PATH}")
     return artifact
-
 
 def load_fusion_model():
     if not os.path.exists(MODEL_PATH):
@@ -595,7 +583,7 @@ def evaluate_split(split, artifact):
     x, y, _, conditions, _ = records_to_matrix(records)
     probs = fusion_predict_proba(artifact, x)
 
-    threshold = DECISION_THRESHOLD
+    threshold = float(artifact.get("threshold", 0.5))
 
     metrics = calculate_metrics(y, probs, threshold)
 
@@ -624,7 +612,7 @@ def evaluate_split(split, artifact):
             if mask.sum() == 0 or len(np.unique(y[mask])) < 2:
                 continue
             condition_results[cond] = calculate_metrics(
-                y[mask], probs[mask], DECISION_THRESHOLD
+                y[mask], probs[mask], threshold
             )
         result["condition_results"] = condition_results
 
@@ -676,7 +664,7 @@ def main():
     print("Architecture: Log-Mel -> CNN-GRU -> probability")
     print("              CQCC    -> Aux MLP -> probability")
     print("              OOF logistic late fusion -> final probability")
-    print("Decision threshold: 0.50 for both clean and degraded evaluation.")
+    print("Decision threshold: selected once from cross-fitted development predictions only.")
 
     if args.eval_only:
         artifact = load_fusion_model()

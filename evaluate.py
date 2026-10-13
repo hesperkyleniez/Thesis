@@ -63,6 +63,7 @@ def evaluate_on_test(model_name, model_class, test_split="test"):
     print(f"{'='*60}")
 
     model_dir = os.path.join(MODELS_DIR, model_name)
+    uses_aux = bool(getattr(model_class, "uses_aux_features", False))
 
     # Load fold results to get norm stats
     # Use fold 1 norm stats as approximation for final model
@@ -74,19 +75,23 @@ def evaluate_on_test(model_name, model_class, test_split="test"):
 
     results = list(np.load(results_path, allow_pickle=True))
 
-    # Load final norm stats saved by retrain.py
-    norm_path = os.path.join(model_dir, "final_norm_stats.npy")
-    if os.path.exists(norm_path):
-        norm      = np.load(norm_path, allow_pickle=True).item()
-        mfcc_mean = norm['mfcc_mean']
-        mfcc_std  = norm['mfcc_std']
-        print(f"  Using: final_norm_stats.npy (MFCC only -- F0 is computed fresh below)")
+    # Auxiliary normalization is required only by CNN-GRU-F.
+    if uses_aux:
+        norm_path = os.path.join(model_dir, "final_norm_stats.npy")
+        if os.path.exists(norm_path):
+            norm = np.load(norm_path, allow_pickle=True).item()
+            mfcc_mean = norm['mfcc_mean']
+            mfcc_std = norm['mfcc_std']
+            print("  Using: final_norm_stats.npy")
+        else:
+            print("  No final norm stats — averaging CV fold MFCC stats")
+            mfcc_means = np.stack([r['norm']['mfcc_mean'] for r in results])
+            mfcc_stds = np.stack([r['norm']['mfcc_std'] for r in results])
+            mfcc_mean = mfcc_means.mean(axis=0)
+            mfcc_std = mfcc_stds.mean(axis=0)
     else:
-        print(f"  ⚠️  No final norm stats — averaging CV fold stats")
-        mfcc_means = np.stack([r['norm']['mfcc_mean'] for r in results])
-        mfcc_stds  = np.stack([r['norm']['mfcc_std']  for r in results])
-        mfcc_mean  = mfcc_means.mean(axis=0)
-        mfcc_std   = mfcc_stds.mean(axis=0)
+        mfcc_mean = mfcc_std = None
+        print("  Log-Mel-only model: MFCC/F0 normalization skipped")
 
     # Load model — try final model first, fall back to fold 1
     final_path = os.path.join(model_dir, "final_model.pt")
@@ -113,17 +118,14 @@ def evaluate_on_test(model_name, model_class, test_split="test"):
     test_files = get_test_files(test_split)
     print(f"  Test files: {len(test_files)}")
 
-    # F0 is normalized per-speaker using the TEST set's own speakers --
-    # they were never seen during training, so any train-derived F0
-    # mean/std would be normalizing against the wrong population's pitch
-    # range entirely. This only reads raw F0 values, never labels, so
-    # there's no leakage in computing it here.
-    print("  Computing per-speaker F0 stats for test set...")
-    test_f0_speaker_stats, test_f0_fallback = compute_per_speaker_f0_stats(test_files)
-
-    # Normalize tensors
-    mfcc_mean_t = torch.FloatTensor(mfcc_mean).to(device)
-    mfcc_std_t  = torch.FloatTensor(mfcc_std).to(device)
+    if uses_aux:
+        print("  Computing per-speaker F0 stats for test set...")
+        test_f0_speaker_stats, test_f0_fallback = compute_per_speaker_f0_stats(test_files)
+        mfcc_mean_t = torch.FloatTensor(mfcc_mean).to(device)
+        mfcc_std_t = torch.FloatTensor(mfcc_std).to(device)
+    else:
+        test_f0_speaker_stats = {}
+        test_f0_fallback = None
 
     # Soft voting — clip level
     clip_probs  = {}
@@ -133,27 +135,17 @@ def evaluate_on_test(model_name, model_class, test_split="test"):
     with torch.no_grad():
         for path in tqdm(test_files, desc="Evaluating", leave=False):
             try:
-                f0_mean, f0_std = lookup_f0_stats(
-                    path, test_f0_speaker_stats, test_f0_fallback
-                )
-                f0_mean_t = torch.FloatTensor(f0_mean).to(device)
-                f0_std_t  = torch.FloatTensor(f0_std).to(device)
+                with np.load(path, allow_pickle=True) as d:
+                    lb = int(d['label'])
+                    lm = torch.FloatTensor(d['logmel']).unsqueeze(1).to(device)
+                    if uses_aux:
+                        f0_mean, f0_std = lookup_f0_stats(path, test_f0_speaker_stats, test_f0_fallback)
+                        f0_mean_t = torch.FloatTensor(f0_mean).to(device)
+                        f0_std_t = torch.FloatTensor(f0_std).to(device)
+                        mc = (torch.FloatTensor(d['mfcc']).to(device) - mfcc_mean_t) / mfcc_std_t
+                        f0 = (torch.FloatTensor(d['f0']).to(device) - f0_mean_t) / f0_std_t
 
-                d  = np.load(path, allow_pickle=True)
-                n  = int(d['n_windows'])
-                lb = int(d['label'])
-
-                lm = torch.FloatTensor(
-                    d['logmel']).unsqueeze(1).to(device)
-                mc = (torch.FloatTensor(
-                    d['mfcc']).to(device) - mfcc_mean_t
-                    ) / mfcc_std_t
-                f0 = (torch.FloatTensor(
-                    d['f0']).to(device) - f0_mean_t
-                    ) / f0_std_t
-                d.close()
-
-                logits = model(lm, mc, f0)
+                logits = model(lm, mc, f0) if uses_aux else model(lm)
                 probs  = torch.sigmoid(logits).cpu().numpy().flatten()
 
                 clip_probs[path]  = probs.tolist()

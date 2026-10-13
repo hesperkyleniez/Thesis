@@ -112,7 +112,8 @@ FFV_VECTOR_DIM = FFV_NUM_FILTERS * 2  # frame mean + std => 14-D
 # Kept separate from AUGMENTATION_SPLITS so the assignment proportions never
 # change when degradation strength is tuned. Values follow the current thesis.
 GAUSSIAN_NOISE_STD = 0.003
-URBAN_SNR_DB       = 5.0
+URBAN_SNR_DB       = 5.0  # held-out evaluation stays fixed at the original 5 dB
+URBAN_TRAIN_SNR_DB = (0.0, 5.0, 10.0, 15.0)  # development-only diversity
 RIR_WET_RATIO      = 0.04
 RIR_MAX_SEC        = 0.10
 # Low-bitrate telephone/VoIP channel variants. The condition assignment remains

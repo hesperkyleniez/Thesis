@@ -6,7 +6,7 @@
 #   CQCC    -> CQCC MLP -> window probabilities
 #   F0      -> F0 MLP -> window probabilities
 # The fusion classifier is trained only from speaker-grouped OOF predictions.
-# Both clean and degraded evaluation use the thesis decision threshold 0.50.
+# One global threshold is selected from cross-fitted development predictions only, then locked for held-out evaluation.
 
 import os
 import sys
@@ -18,6 +18,7 @@ from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import StandardScaler
+from robustness import condition_balanced_weights, choose_condition_balanced_threshold
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
@@ -38,7 +39,7 @@ from f0_train import F0_DIM, F0MLP, F0_VERSION
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-VERSION = "v14_cnn_gru_cqcc_f0_oof_late_fusion"
+VERSION = "v16_robust_all_cnn_gru_cqcc_f0"
 OOF_CACHE_VERSION = VERSION
 FUSION_NAME = "CNN-GRU-CQCC-F0-F"
 MODEL_DIR = os.path.join(MODELS_DIR, "Prediction-Fusion", FUSION_NAME)
@@ -49,7 +50,8 @@ OOF_CACHE_PATH = os.path.join(MODEL_DIR, "oof_predictions.npy")
 # Small regularization search. Selection is speaker-grouped at the meta level.
 C_GRID = (0.01, 0.1, 1.0, 10.0, 100.0)
 
-# Chapter III uses a fixed 0.50 decision threshold for all evaluations.
+# Threshold is selected once from cross-fitted development predictions only.
+# The held-out test set never participates in threshold selection.
 DECISION_THRESHOLD = 0.50
 
 # Inference batch sizes. These affect speed only, not methodology.
@@ -403,7 +405,7 @@ def collect_oof_predictions(rebuild_cache=False):
     return records
 
 
-def choose_regularization(x, y, groups):
+def choose_regularization(x, y, groups, conditions):
     unique_groups = np.unique(groups)
     n_splits = min(4, len(unique_groups))
     if n_splits < 2:
@@ -427,10 +429,12 @@ def choose_regularization(x, y, groups):
                 max_iter=5000,
                 random_state=SEED,
             )
-            clf.fit(x_train, y[train_idx])
+            train_w = condition_balanced_weights(conditions[train_idx])
+            val_w = condition_balanced_weights(conditions[val_idx])
+            clf.fit(x_train, y[train_idx], sample_weight=train_w)
             p = clf.predict_proba(x_val)[:, 1]
             fold_losses.append(
-                log_loss(y[val_idx], np.clip(p, 1e-6, 1 - 1e-6), labels=[0, 1])
+                log_loss(y[val_idx], np.clip(p, 1e-6, 1 - 1e-6), labels=[0, 1], sample_weight=val_w)
             )
 
         mean_loss = float(np.mean(fold_losses))
@@ -443,7 +447,7 @@ def choose_regularization(x, y, groups):
     return best_c
 
 
-def cross_fitted_meta_probabilities(x, y, groups, c):
+def cross_fitted_meta_probabilities(x, y, groups, conditions, c):
     unique_groups = np.unique(groups)
     n_splits = min(4, len(unique_groups))
     splitter = GroupKFold(n_splits=n_splits)
@@ -461,7 +465,8 @@ def cross_fitted_meta_probabilities(x, y, groups, c):
             max_iter=5000,
             random_state=SEED,
         )
-        clf.fit(x_train, y[train_idx])
+        train_w = condition_balanced_weights(conditions[train_idx])
+        clf.fit(x_train, y[train_idx], sample_weight=train_w)
         probs[val_idx] = clf.predict_proba(x_val)[:, 1]
 
     if np.isnan(probs).any():
@@ -472,8 +477,11 @@ def cross_fitted_meta_probabilities(x, y, groups, c):
 def fit_fusion_model(records):
     x, y, groups, conditions, _ = records_to_matrix(records)
 
-    best_c = choose_regularization(x, y, groups)
-    meta_oof_probs = cross_fitted_meta_probabilities(x, y, groups, best_c)
+    best_c = choose_regularization(x, y, groups, conditions)
+    meta_oof_probs = cross_fitted_meta_probabilities(x, y, groups, conditions, best_c)
+    tuned_threshold, threshold_macro_f1, threshold_overall_f1 = choose_condition_balanced_threshold(
+        y, meta_oof_probs, conditions
+    )
 
     scaler = StandardScaler()
     x_scaled = scaler.fit_transform(x)
@@ -483,7 +491,8 @@ def fit_fusion_model(records):
         max_iter=5000,
         random_state=SEED,
     )
-    clf.fit(x_scaled, y)
+    fusion_weights = condition_balanced_weights(conditions)
+    clf.fit(x_scaled, y, sample_weight=fusion_weights)
 
     clean_mask = np.asarray([str(c) == "clean" for c in conditions], dtype=bool)
     degraded_mask = ~clean_mask
@@ -494,7 +503,7 @@ def fit_fusion_model(records):
         return float(
             f1_score(
                 y[mask],
-                (meta_oof_probs[mask] >= DECISION_THRESHOLD).astype(int),
+                (meta_oof_probs[mask] >= tuned_threshold).astype(int),
                 zero_division=0,
             )
         )
@@ -508,7 +517,9 @@ def fit_fusion_model(records):
         "scaler_scale": scaler.scale_.astype(np.float64),
         "coef": clf.coef_.reshape(-1).astype(np.float64),
         "intercept": float(clf.intercept_[0]),
-        "threshold": DECISION_THRESHOLD,
+        "threshold": tuned_threshold,
+        "threshold_macro_condition_f1": threshold_macro_f1,
+        "threshold_overall_f1": threshold_overall_f1,
         "meta_oof_clean_f1": subset_f1(clean_mask),
         "meta_oof_degraded_f1": subset_f1(degraded_mask),
         "n_oof_clips": int(len(y)),
@@ -523,7 +534,9 @@ def fit_fusion_model(records):
     print(f"  OOF clips      : {len(y):,}")
     print(f"  OOF clean      : {clean_mask.sum():,}")
     print(f"  OOF degraded   : {degraded_mask.sum():,}")
-    print(f"  Threshold      : {DECISION_THRESHOLD:.2f} (fixed)")
+    print(f"  OOF threshold  : {tuned_threshold:.3f} (condition-macro F1 selected)")
+    print(f"  OOF macro F1   : {threshold_macro_f1:.4f}")
+    print(f"  OOF overall F1 : {threshold_overall_f1:.4f}")
     if artifact["meta_oof_clean_f1"] is not None:
         print(f"  OOF clean F1   : {artifact['meta_oof_clean_f1']:.4f}")
     if artifact["meta_oof_degraded_f1"] is not None:
@@ -596,7 +609,7 @@ def evaluate_split(split, artifact):
     x, y, _, conditions, _ = records_to_matrix(records)
     probs = fusion_predict_proba(artifact, x)
 
-    threshold = DECISION_THRESHOLD
+    threshold = float(artifact.get("threshold", DECISION_THRESHOLD))
 
     metrics = calculate_metrics(y, probs, threshold)
 
@@ -625,7 +638,7 @@ def evaluate_split(split, artifact):
             if mask.sum() == 0 or len(np.unique(y[mask])) < 2:
                 continue
             condition_results[cond] = calculate_metrics(
-                y[mask], probs[mask], DECISION_THRESHOLD
+                y[mask], probs[mask], threshold
             )
         result["condition_results"] = condition_results
 
@@ -678,7 +691,7 @@ def main():
     print("              CQCC    -> Aux MLP -> probability")
     print("              F0      -> Aux MLP -> probability")
     print("              OOF logistic late fusion -> final probability")
-    print("Decision threshold: 0.50 for both clean and degraded evaluation.")
+    print("Decision threshold: selected from cross-fitted development predictions only.")
 
     if args.eval_only:
         artifact = load_fusion_model()

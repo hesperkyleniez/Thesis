@@ -44,6 +44,7 @@ from train import (
     CNNGRUOnly,
     CNNGRUFusion,
     HybridDataset,
+    LogMelOnlyDataset,
     collate_with_paths,
     set_seed,
     USE_AMP,
@@ -154,15 +155,17 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
 
     for logmel, mfcc, f0, labels, _ in loader:
         logmel = logmel.to(DEVICE, non_blocking=True)
-        mfcc = mfcc.to(DEVICE, non_blocking=True)
-        f0 = f0.to(DEVICE, non_blocking=True)
         labels = labels.to(DEVICE, non_blocking=True)
+        uses_aux = bool(getattr(model, "uses_aux_features", False))
+        if uses_aux:
+            mfcc = mfcc.to(DEVICE, non_blocking=True)
+            f0 = f0.to(DEVICE, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         if USE_AMP:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(logmel, mfcc, f0)
+                logits = model(logmel, mfcc, f0) if uses_aux else model(logmel)
                 loss = criterion(logits, labels)
 
             scaler.scale(loss).backward()
@@ -171,7 +174,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(logmel, mfcc, f0)
+            logits = model(logmel, mfcc, f0) if uses_aux else model(logmel)
             loss = criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
@@ -230,33 +233,25 @@ def retrain_model(model_name, model_class):
 
     print(f"  Total development files: {len(all_files):,}")
 
-    mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback = compute_fold_norm_stats(
-        all_files
-    )
+    uses_aux = bool(getattr(model_class, "uses_aux_features", False))
+    if uses_aux:
+        mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback = compute_fold_norm_stats(all_files)
+        train_ds = HybridDataset(all_files, mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback,
+                                 desc="Full Train", max_windows=MAX_TRAIN_WINDOWS_PER_FILE, seed=SEED)
+    else:
+        print("  Log-Mel-only model: skipping MFCC/F0 normalization and loading.")
+        mfcc_mean = np.zeros(80, dtype=np.float32)
+        mfcc_std = np.ones(80, dtype=np.float32)
+        f0_speaker_stats = {}
+        f0_fallback = (np.zeros(8, dtype=np.float32), np.ones(8, dtype=np.float32))
+        train_ds = LogMelOnlyDataset(all_files, desc="Full Train", max_windows=MAX_TRAIN_WINDOWS_PER_FILE)
 
-    np.save(
-        norm_stats_path,
-        {
-            "mfcc_mean": mfcc_mean,
-            "mfcc_std": mfcc_std,
-            "f0_speaker_stats": f0_speaker_stats,
-            "f0_fallback": f0_fallback,
-            "training_version": version,
-        },
-    )
-    print(f"  Normalization stats saved: {norm_stats_path}")
-
-    print("  Loading development windows into RAM...")
-    train_ds = HybridDataset(
-        all_files,
-        mfcc_mean,
-        mfcc_std,
-        f0_speaker_stats,
-        f0_fallback,
-        desc="Full Train",
-        max_windows=MAX_TRAIN_WINDOWS_PER_FILE,
-        seed=SEED,
-    )
+    np.save(norm_stats_path, {
+        "mfcc_mean": mfcc_mean, "mfcc_std": mfcc_std,
+        "f0_speaker_stats": f0_speaker_stats, "f0_fallback": f0_fallback,
+        "training_version": version,
+    })
+    print(f"  Normalization metadata saved: {norm_stats_path}")
 
     generator = torch.Generator()
     generator.manual_seed(SEED)

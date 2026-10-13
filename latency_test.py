@@ -16,6 +16,11 @@ from train import CNNOnly, CNNGRUOnly, CNNGRUFusion
 from cqcc_train import CQCC_DIM, CQCCMLP, CQCC_VERSION
 from ffv_train import FFV_DIM, FFVMLP, FFV_VERSION
 from f0_train import F0_DIM, F0MLP, F0_VERSION
+from cqcc_fusion import (
+    load_fusion_model as load_cqcc_fusion_model,
+    fusion_predict_proba as cqcc_fusion_predict_proba,
+    summarize_probabilities as summarize_cqcc_probabilities,
+)
 from cqcc_ffv_fusion import (
     load_fusion_model as load_ffv_fusion_model,
     fusion_predict_proba as ffv_fusion_predict_proba,
@@ -29,7 +34,7 @@ from cqcc_f0_fusion import (
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CNN-GRU-CQCC-FFV-F", "CNN-GRU-CQCC-F0-F")
+MODEL_CHOICES = ("CNN-only", "CNN-GRU", "CNN-GRU-F", "CNN-GRU-CQCC-F", "CNN-GRU-CQCC-F0-F", "CNN-GRU-CQCC-FFV-F")
 
 
 def sync():
@@ -117,6 +122,24 @@ def build_runner(model_name):
             f0t = torch.from_numpy(f0.astype(np.float32)).unsqueeze(0).to(DEVICE)
             with torch.inference_mode():
                 return torch.sigmoid(model(lm, mc, f0t)).item()
+        return run
+
+    if model_name == "CNN-GRU-CQCC-F":
+        cnn = load_state(CNNGRUOnly(dropout=0.0).to(DEVICE), "CNN-GRU")
+        cqcc = load_state(CQCCMLP(CQCC_DIM).to(DEVICE), "CQCC")
+        cqcc_mean, cqcc_std = load_cqcc_stats()
+        fusion = load_cqcc_fusion_model()
+
+        def run(audio):
+            logmel = extract_logmel(audio)
+            cq = (extract_cqcc(audio) - cqcc_mean) / cqcc_std
+            lm = torch.from_numpy(logmel).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            cqt = torch.from_numpy(cq.astype(np.float32)).unsqueeze(0).to(DEVICE)
+            with torch.inference_mode():
+                p_cnn = torch.sigmoid(cnn(lm, None, None)).item()
+                p_cqcc = torch.sigmoid(cqcc(cqt)).item()
+            x = summarize_cqcc_probabilities([p_cnn], [p_cqcc]).reshape(1, -1)
+            return float(cqcc_fusion_predict_proba(fusion, x)[0])
         return run
 
     if model_name == "CNN-GRU-CQCC-FFV-F":

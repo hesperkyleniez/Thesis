@@ -15,6 +15,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, roc_curve
 from tqdm import tqdm
+from robustness import macro_condition_f1
 
 sys.path.insert(0, r"D:\Thesis\code")
 from config import (
@@ -25,7 +26,7 @@ from config import (
     LR_FACTOR, MAX_TRAIN_WINDOWS_PER_FILE,
 )
 
-CQCC_VERSION = "v14_b12_todisco_pipeline_cqcc_expert"
+CQCC_VERSION = "v16_robust_all_cqcc_expert"
 
 
 def set_seed(seed=SEED):
@@ -251,8 +252,10 @@ def validate(model, loader, criterion):
 
     f1 = f1_score(labels, preds, zero_division=0)
     auc = roc_auc_score(labels, scores) if len(np.unique(labels)) > 1 else 0.0
+    paths = list(clip_probs.keys())
+    cond_macro = macro_condition_f1(paths, labels, scores, threshold=0.5)
 
-    return total_loss / max(len(loader), 1), f1, auc
+    return total_loss / max(len(loader), 1), f1, auc, cond_macro
 
 
 def eer(labels, probs):
@@ -321,6 +324,7 @@ def train_cqcc():
         scaler = make_scaler()
 
         best_f1 = -1.0
+        best_macro = -1.0
         best_epoch = 1
         patience = 0
         best_path = os.path.join(model_dir, f"best_fold{fold}.pt")
@@ -329,10 +333,11 @@ def train_cqcc():
         for epoch in range(1, CQCC_MAX_EPOCHS + 1):
             start = time.time()
             loss = train_epoch(model, train_loader, optimizer, criterion, scaler)
-            val_loss, val_f1, val_auc = validate(model, val_loader, criterion)
+            val_loss, val_f1, val_auc, val_macro = validate(model, val_loader, criterion)
             scheduler.step(val_loss)
 
-            if val_f1 > best_f1 + 1e-6:
+            if val_macro > best_macro + 1e-6:
+                best_macro = val_macro
                 best_f1 = val_f1
                 best_epoch = epoch
                 patience = 0
@@ -343,7 +348,7 @@ def train_cqcc():
             print(
                 f"  Epoch {epoch:02d}/{CQCC_MAX_EPOCHS} "
                 f"TrainLoss {loss:.4f} ValLoss {val_loss:.4f} "
-                f"ClipF1 {val_f1:.4f} AUC {val_auc:.4f} "
+                f"ClipF1 {val_f1:.4f} CondMacroF1 {val_macro:.4f} AUC {val_auc:.4f} "
                 f"ES {patience}/{CQCC_PATIENCE} "
                 f"{time.time()-start:.0f}s"
             )
@@ -353,13 +358,14 @@ def train_cqcc():
 
         state = torch.load(best_path, map_location=DEVICE, weights_only=True)
         model.load_state_dict(state)
-        _, _, val_auc = validate(model, val_loader, criterion)
+        _, _, val_auc, _ = validate(model, val_loader, criterion)
 
         results.append({
             "training_version": CQCC_VERSION,
             "fold": fold,
             "best_epoch": best_epoch,
             "best_f1": best_f1,
+            "best_condition_macro_f1": best_macro,
             "auc": val_auc,
             "mean": mean,
             "std": std,

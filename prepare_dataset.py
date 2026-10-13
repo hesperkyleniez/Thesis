@@ -5,6 +5,7 @@ uses augmentation.py as the single degradation implementation so training and
 robustness evaluation cannot silently drift apart.
 """
 
+import argparse
 import hashlib
 import os
 import random
@@ -39,7 +40,7 @@ from dataset import load_all_files
 from augmentation import collect_rir_files, apply_augmentation, peak_normalize
 from features import extract_clip_features
 
-CACHE_VERSION = "v14_fast_clip_cqcc_b12_normffv_yin"
+CACHE_VERSION = "v15_robust_noise_diversity_cqcc_f0"
 
 
 def set_seed(seed=SEED):
@@ -169,7 +170,7 @@ def _process_one(sample, split_name, room_rirs, mobile_rirs, urban_files, condit
         else:
             audio = apply_augmentation(
                 audio, condition, room_rirs, mobile_rirs, urban_files,
-                rng=pair_rng(filepath),
+                rng=pair_rng(filepath), training=(split_name == "train"),
             )
 
         feat = extract_clip_features(audio)
@@ -229,15 +230,19 @@ def process_split(samples, split_name, room_rirs, mobile_rirs, urban_files, cond
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--train-only", action="store_true",
+        help="Rebuild only development features. Recommended for the robustness rerun so held-out caches stay untouched.",
+    )
+    args = parser.parse_args()
+
     set_seed(SEED)
     os.makedirs(FEATURES_DIR, exist_ok=True)
     room_rirs, mobile_rirs, urban_files = ensure_resources()
 
     train_samples = load_all_files(TRAIN_DIR)
-    test_samples = load_all_files(TEST_DIR)
     print(f"Training/development files: {len(train_samples):,}")
-    print(f"Held-out test files        : {len(test_samples):,}")
-
     conditions = assign_fixed_conditions(train_samples)
 
     t0 = time.time()
@@ -246,11 +251,16 @@ def main():
     )
     print(f"Training cache time: {(time.time()-t0)/60:.1f} min")
 
-    t0 = time.time()
-    process_split(
-        test_samples, "test", room_rirs, mobile_rirs, urban_files, conditions=None
-    )
-    print(f"Clean test cache time: {(time.time()-t0)/60:.1f} min")
+    if not args.train_only:
+        test_samples = load_all_files(TEST_DIR)
+        print(f"Held-out test files        : {len(test_samples):,}")
+        t0 = time.time()
+        process_split(
+            test_samples, "test", room_rirs, mobile_rirs, urban_files, conditions=None
+        )
+        print(f"Clean test cache time: {(time.time()-t0)/60:.1f} min")
+    else:
+        print("Held-out clean/degraded caches left untouched (--train-only).")
 
     print("\nDataset preparation complete.")
 

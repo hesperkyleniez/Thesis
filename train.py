@@ -19,6 +19,7 @@ from sklearn.metrics import (
     roc_auc_score, roc_curve
 )
 from tqdm import tqdm
+from robustness import macro_condition_f1
 
 sys.path.insert(0, r"D:\Thesis\code")
 from config import (
@@ -32,11 +33,11 @@ from config import (
 # -----------------------------------------------------------------------------
 # Reproducibility and device
 # -----------------------------------------------------------------------------
-TRAINING_VERSION = "v14_mfcc_fast_yin_f0"
+TRAINING_VERSION = "v16_robust_all_models"
 # Preserve unchanged architectures so compatible v11/v12 checkpoints are reused.
 MODEL_VERSIONS = {
-    "CNN-only": "v11_clean_four_models_robust_telephone",
-    "CNN-GRU": "v11_clean_four_models_robust_telephone",
+    "CNN-only": TRAINING_VERSION,
+    "CNN-GRU": TRAINING_VERSION,
     "CNN-GRU-F": TRAINING_VERSION,
 }
 
@@ -187,6 +188,58 @@ class HybridDataset(Dataset):
         )
 
 
+class LogMelOnlyDataset(Dataset):
+    """RAM dataset for CNN-only/CNN-GRU. Reads ONLY Log-Mel + labels."""
+    def __init__(self, npz_files, desc="Loading", max_windows=None):
+        self.index = []
+        logmel_list = []
+        label_list = []
+        total_windows_seen = 0
+        total_windows_kept = 0
+
+        for path in tqdm(npz_files, desc=desc, leave=False):
+            try:
+                with np.load(path, allow_pickle=True) as d:
+                    n = int(d["n_windows"])
+                    label = int(d["label"])
+                    full_logmel = d["logmel"]
+                    if max_windows is not None and n > max_windows:
+                        indices = np.linspace(0, n - 1, max_windows, dtype=np.int64)
+                    else:
+                        indices = np.arange(n, dtype=np.int64)
+                    total_windows_seen += n
+                    total_windows_kept += len(indices)
+                    for i in indices:
+                        self.index.append((path, int(i)))
+                        logmel_list.append(full_logmel[i])
+                        label_list.append(label)
+            except Exception as e:
+                print(f"WARNING: {os.path.basename(path)}: {e}")
+
+        if not label_list:
+            raise RuntimeError(f"No valid windows found for {desc} dataset.")
+        if total_windows_seen > 0:
+            kept_pct = 100.0 * total_windows_kept / total_windows_seen
+            print(f"  {desc}: kept {total_windows_kept:,}/{total_windows_seen:,} windows "
+                  f"({kept_pct:.1f}%) from {len(npz_files):,} files")
+
+        self.logmel = torch.as_tensor(np.stack(logmel_list), dtype=torch.float32).unsqueeze(1).contiguous()
+        self.labels = torch.as_tensor(label_list, dtype=torch.float32).unsqueeze(1)
+        # Empty placeholders keep the existing collate/training API intact without
+        # loading, normalizing, storing, or transferring real MFCC/F0 features.
+        n_items = len(self.labels)
+        self.mfcc = torch.empty((n_items, 0), dtype=torch.float32)
+        self.f0 = torch.empty((n_items, 0), dtype=torch.float32)
+        print(f"  {desc}: {n_items:,} Log-Mel windows loaded into RAM (MFCC/F0 skipped)")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        path, _ = self.index[idx]
+        return self.logmel[idx], self.mfcc[idx], self.f0[idx], self.labels[idx], path
+
+
 # -----------------------------------------------------------------------------
 # Model components
 # -----------------------------------------------------------------------------
@@ -208,14 +261,15 @@ class CNNBlock(nn.Module):
 
 
 class SpecAugment(nn.Module):
-    def __init__(self, freq_mask=20, time_mask=20, num_masks=2):
+    def __init__(self, freq_mask=10, time_mask=0, num_masks=1, apply_prob=0.5):
         super().__init__()
         self.freq_mask = freq_mask
         self.time_mask = time_mask
         self.num_masks = num_masks
+        self.apply_prob = apply_prob
 
     def forward(self, x):
-        if not self.training:
+        if not self.training or torch.rand(1, device=x.device).item() > self.apply_prob:
             return x
 
         x = x.clone()
@@ -252,7 +306,7 @@ class TemporalCNNGRUEncoder(nn.Module):
         super().__init__()
         spatial_dropout = min(0.10, dropout * 0.20)
 
-        self.spec_aug = SpecAugment(freq_mask=20, time_mask=20, num_masks=2)
+        self.spec_aug = SpecAugment(freq_mask=10, time_mask=0, num_masks=1, apply_prob=0.5)
         self.cnn = nn.Sequential(
             CNNBlock(1, 32, spatial_dropout, bias=False),
             CNNBlock(32, 64, spatial_dropout, bias=False),
@@ -294,6 +348,7 @@ class TemporalCNNGRUEncoder(nn.Module):
 
 
 class CNNOnly(nn.Module):
+    uses_aux_features = False
     """Baseline 1: CNN only."""
     def __init__(self, dropout=0.5):
         super().__init__()
@@ -327,6 +382,7 @@ class CNNOnly(nn.Module):
 
 
 class CNNGRUOnly(nn.Module):
+    uses_aux_features = False
     """
     Baseline 2: CNN-GRU using Log-Mel only.
     Keeps the paper's single 128-unit GRU and lightweight three-block CNN.
@@ -350,6 +406,7 @@ class CNNGRUOnly(nn.Module):
         return {}
 
 class CNNGRUFusion(nn.Module):
+    uses_aux_features = True
     """
     Thesis feature-fusion model:
       Log-Mel -> CNN-GRU -> 128-D embedding
@@ -569,15 +626,17 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
 
     for logmel, mfcc, f0, labels, _ in loader:
         logmel = logmel.to(device, non_blocking=True)
-        mfcc = mfcc.to(device, non_blocking=True)
-        f0 = f0.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+        uses_aux = bool(getattr(model, "uses_aux_features", False))
+        if uses_aux:
+            mfcc = mfcc.to(device, non_blocking=True)
+            f0 = f0.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
 
         if USE_AMP:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(logmel, mfcc, f0)
+                logits = model(logmel, mfcc, f0) if uses_aux else model(logmel)
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -585,7 +644,7 @@ def train_epoch(model, loader, optimizer, criterion, scaler):
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(logmel, mfcc, f0)
+            logits = model(logmel, mfcc, f0) if uses_aux else model(logmel)
             loss = criterion(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -610,16 +669,18 @@ def validate_with_clip_f1(model, loader, criterion):
     with torch.no_grad():
         for logmel, mfcc, f0, labels, paths in loader:
             logmel = logmel.to(device, non_blocking=True)
-            mfcc = mfcc.to(device, non_blocking=True)
-            f0 = f0.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            uses_aux = bool(getattr(model, "uses_aux_features", False))
+            if uses_aux:
+                mfcc = mfcc.to(device, non_blocking=True)
+                f0 = f0.to(device, non_blocking=True)
 
             if USE_AMP:
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits = model(logmel, mfcc, f0)
+                    logits = model(logmel, mfcc, f0) if uses_aux else model(logmel)
                     loss = criterion(logits, labels)
             else:
-                logits = model(logmel, mfcc, f0)
+                logits = model(logmel, mfcc, f0) if uses_aux else model(logmel)
                 loss = criterion(logits, labels)
 
             probs = torch.sigmoid(logits)
@@ -649,18 +710,23 @@ def validate_with_clip_f1(model, loader, criterion):
     clip_f1 = f1_score(
         clip_targets, clip_preds, zero_division=0
     ) if clip_targets else 0.0
+    clip_paths = list(clip_probs.keys())
+    condition_macro_f1 = macro_condition_f1(
+        clip_paths, clip_targets, clip_scores, threshold=0.5
+    ) if clip_targets else 0.0
 
     return (
         total_loss / max(len(loader), 1),
         correct / max(total, 1),
         clip_f1,
+        condition_macro_f1,
         clip_preds,
         clip_targets,
         clip_scores,
     )
 
 
-def soft_vote(model, val_files, mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback):
+def soft_vote(model, val_files, mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback, logmel_only=False):
     model.eval()
     clip_probs = []
     clip_labels = []
@@ -672,31 +738,21 @@ def soft_vote(model, val_files, mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallba
     with torch.no_grad():
         for path in tqdm(val_files, desc="Soft voting", leave=False):
             try:
-                f0_mean, f0_std = lookup_f0_stats(path, f0_speaker_stats, f0_fallback)
-                f0_mean_t = torch.as_tensor(f0_mean, dtype=torch.float32, device=device)
-                f0_std_t = torch.as_tensor(f0_std, dtype=torch.float32, device=device)
-
                 with np.load(path, allow_pickle=True) as d:
-                    lm = torch.as_tensor(
-                        d["logmel"], dtype=torch.float32, device=device
-                    ).unsqueeze(1)
-                    mc = (
-                        torch.as_tensor(
-                            d["mfcc"], dtype=torch.float32, device=device
-                        ) - mfcc_mean_t
-                    ) / mfcc_std_t
-                    f0 = (
-                        torch.as_tensor(
-                            d["f0"], dtype=torch.float32, device=device
-                        ) - f0_mean_t
-                    ) / f0_std_t
+                    lm = torch.as_tensor(d["logmel"], dtype=torch.float32, device=device).unsqueeze(1)
                     label = int(d["label"])
+                    if not logmel_only:
+                        f0_mean, f0_std = lookup_f0_stats(path, f0_speaker_stats, f0_fallback)
+                        f0_mean_t = torch.as_tensor(f0_mean, dtype=torch.float32, device=device)
+                        f0_std_t = torch.as_tensor(f0_std, dtype=torch.float32, device=device)
+                        mc = (torch.as_tensor(d["mfcc"], dtype=torch.float32, device=device) - mfcc_mean_t) / mfcc_std_t
+                        f0 = (torch.as_tensor(d["f0"], dtype=torch.float32, device=device) - f0_mean_t) / f0_std_t
 
                 if USE_AMP:
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        logits = model(lm, mc, f0)
+                        logits = model(lm) if logmel_only else model(lm, mc, f0)
                 else:
-                    logits = model(lm, mc, f0)
+                    logits = model(lm) if logmel_only else model(lm, mc, f0)
 
                 probs = torch.sigmoid(logits).float().cpu().numpy().reshape(-1)
                 score = float(np.mean(probs))
@@ -782,40 +838,27 @@ def train_model(model_name, model_class):
         print(f"  Train files : {len(train_files):,}")
         print(f"  Val files   : {len(val_files):,}")
 
-        mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback = compute_fold_norm_stats(
-            train_files
-        )
-
-        # Val speakers are different people from train speakers (that's
-        # the whole point of speaker-grouped CV) -- they don't exist in
-        # f0_speaker_stats at all. Compute their own per-speaker F0 stats
-        # from their own data, same as train. MFCC normalization is
-        # unchanged and still uses the train-derived mfcc_mean/std.
-        val_f0_speaker_stats, val_f0_fallback = compute_per_speaker_f0_stats(
-            val_files
-        )
-
-        print("  Loading training windows into RAM...")
-        train_ds = HybridDataset(
-            train_files,
-            mfcc_mean,
-            mfcc_std,
-            f0_speaker_stats,
-            f0_fallback,
-            desc="Train",
-            max_windows=MAX_TRAIN_WINDOWS_PER_FILE,
-        )
-
-        print("  Loading validation windows into RAM...")
-        val_ds = HybridDataset(
-            val_files,
-            mfcc_mean,
-            mfcc_std,
-            val_f0_speaker_stats,
-            val_f0_fallback,
-            desc="Val",
-            max_windows=MAX_VAL_WINDOWS_PER_FILE,
-        )
+        uses_aux = bool(getattr(model_class, "uses_aux_features", False))
+        if uses_aux:
+            mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback = compute_fold_norm_stats(train_files)
+            val_f0_speaker_stats, val_f0_fallback = compute_per_speaker_f0_stats(val_files)
+            print("  Loading training windows into RAM...")
+            train_ds = HybridDataset(train_files, mfcc_mean, mfcc_std, f0_speaker_stats, f0_fallback,
+                                     desc="Train", max_windows=MAX_TRAIN_WINDOWS_PER_FILE)
+            print("  Loading validation windows into RAM...")
+            val_ds = HybridDataset(val_files, mfcc_mean, mfcc_std, val_f0_speaker_stats, val_f0_fallback,
+                                   desc="Val", max_windows=MAX_VAL_WINDOWS_PER_FILE)
+        else:
+            print("  Log-Mel-only model: skipping MFCC/F0 normalization and loading.")
+            mfcc_mean = np.zeros(80, dtype=np.float32)
+            mfcc_std = np.ones(80, dtype=np.float32)
+            f0_speaker_stats = {}
+            f0_fallback = (np.zeros(8, dtype=np.float32), np.ones(8, dtype=np.float32))
+            val_f0_speaker_stats, val_f0_fallback = f0_speaker_stats, f0_fallback
+            print("  Loading training Log-Mel windows into RAM...")
+            train_ds = LogMelOnlyDataset(train_files, desc="Train", max_windows=MAX_TRAIN_WINDOWS_PER_FILE)
+            print("  Loading validation Log-Mel windows into RAM...")
+            val_ds = LogMelOnlyDataset(val_files, desc="Val", max_windows=MAX_VAL_WINDOWS_PER_FILE)
 
         generator = torch.Generator()
         generator.manual_seed(SEED + fold)
@@ -839,6 +882,7 @@ def train_model(model_name, model_class):
         scaler = make_scaler()
 
         best_val_f1 = -1.0
+        best_macro_f1 = -1.0
         best_epoch = 1
         patience_count = 0
         best_model_path = os.path.join(
@@ -851,7 +895,7 @@ def train_model(model_name, model_class):
             train_loss, train_acc = train_epoch(
                 model, train_loader, optimizer, criterion, scaler
             )
-            val_loss, val_acc, val_clip_f1, _, _, _ = validate_with_clip_f1(
+            val_loss, val_acc, val_clip_f1, val_macro_f1, _, _, _ = validate_with_clip_f1(
                 model, val_loader, criterion
             )
             scheduler.step(val_loss)
@@ -859,8 +903,9 @@ def train_model(model_name, model_class):
             current_lr = optimizer.param_groups[0]["lr"]
             elapsed = time.time() - start
 
-            improved = val_clip_f1 > best_val_f1 + 1e-6
+            improved = val_macro_f1 > best_macro_f1 + 1e-6
             if improved:
+                best_macro_f1 = val_macro_f1
                 best_val_f1 = val_clip_f1
                 best_epoch = epoch
                 patience_count = 0
@@ -872,7 +917,7 @@ def train_model(model_name, model_class):
                 f"  Epoch {epoch:02d}/{MAX_EPOCHS} | "
                 f"Train {train_loss:.4f}/{train_acc:.4f} | "
                 f"Val {val_loss:.4f}/{val_acc:.4f} | "
-                f"Clip F1 {val_clip_f1:.4f} | "
+                f"Clip F1 {val_clip_f1:.4f} | CondMacroF1 {val_macro_f1:.4f} | "
                 f"LR {current_lr:.2e} | "
                 f"ES {patience_count}/{PATIENCE} | "
                 f"{elapsed:.0f}s"
@@ -897,6 +942,7 @@ def train_model(model_name, model_class):
             mfcc_std,
             val_f0_speaker_stats,
             val_f0_fallback,
+            logmel_only=not uses_aux,
         )
 
         if len(labels) == 0:
@@ -934,6 +980,7 @@ def train_model(model_name, model_class):
             "eer": eer,
             "weights": weights,
             "best_epoch": best_epoch,
+            "best_condition_macro_f1": best_macro_f1,
             "norm": {
                 "mfcc_mean": mfcc_mean,
                 "mfcc_std": mfcc_std,
