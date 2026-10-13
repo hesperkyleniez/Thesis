@@ -57,7 +57,9 @@ python latency_test.py --model CNN-GRU-F
 python latency_test.py --model CNN-GRU-CQCC-F0-F
 ```
 
-Use these explicit choices: `latency_test.py --model all` also includes older variants.
+`python latency_test.py --model all` measures exactly these four models.
 
 Outputs are saved under `D:\Thesis\features`, `models`, and `results`.
-All retained Python files are unchanged. `cqcc_fusion.py`, `cqcc_ffv_fusion.py`, and `ffv_train.py` remain because the unchanged latency script imports them; they are not part of the four-model comparison. Existing feature preparation still extracts FFV as well.
+Only the four comparison models are retained, along with their supporting CQCC and F0 experts. Latency testing was updated to remove the other model variants; training, evaluation, and feature extraction are unchanged. Existing feature preparation still extracts FFV as well.
+
+For an automatic run, double-click `run_all.bat` inside the code folder. It checks Python and FFmpeg, runs the stages above in order, reuses existing held-out caches, and stops on an error.
