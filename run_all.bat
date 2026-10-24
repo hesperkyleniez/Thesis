@@ -1,82 +1,23 @@
 @echo off
-setlocal
+REM ImprovedCQCC: start-from-audio development workflow; no held-out model selection.
+REM Expects the original WAV sets, acoustic resources, and speaker split.
 cd /d "%~dp0"
-if errorlevel 1 exit /b 1
-
-if not exist "train.py" (
-    echo ERROR: Put this BAT file inside D:\Thesis\code beside the Python files.
-    pause
-    exit /b 1
-)
-where python >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: Python is not on PATH.
-    pause
-    exit /b 1
-)
-where ffmpeg >nul 2>&1
-if errorlevel 1 (
-    echo ERROR: FFmpeg is not on PATH. Install it before running this pipeline.
-    pause
-    exit /b 1
-)
-
-rem Reuse existing held-out features; create them when no cache is present.
-set "HAVE_CLEAN="
-set "HAVE_DEGRADED="
-for %%F in ("D:\Thesis\features\test\*.npz") do if exist "%%~fF" set "HAVE_CLEAN=1"
-for %%F in ("D:\Thesis\features\test_degraded\*.npz") do if exist "%%~fF" set "HAVE_DEGRADED=1"
-if defined HAVE_CLEAN (
-    call :run python prepare_dataset.py --train-only
-) else (
-    call :run python prepare_dataset.py
-)
-if errorlevel 1 goto :failed
-if not defined HAVE_DEGRADED (
-    call :run python run_degraded_test.py
-    if errorlevel 1 goto :failed
-)
-
-call :run python train.py --model all
-if errorlevel 1 goto :failed
-call :run python retrain.py --model all
-if errorlevel 1 goto :failed
-call :run python evaluate.py --model all
-if errorlevel 1 goto :failed
-call :run python cqcc_train.py
-if errorlevel 1 goto :failed
-call :run python cqcc_retrain.py
-if errorlevel 1 goto :failed
-call :run python f0_train.py
-if errorlevel 1 goto :failed
-call :run python f0_retrain.py
-if errorlevel 1 goto :failed
-call :run python cqcc_f0_fusion.py --rebuild-cache
-if errorlevel 1 goto :failed
-call :run python latency_test.py --model CNN-only
-if errorlevel 1 goto :failed
-call :run python latency_test.py --model CNN-GRU
-if errorlevel 1 goto :failed
-call :run python latency_test.py --model CNN-GRU-F
-if errorlevel 1 goto :failed
-call :run python latency_test.py --model CNN-GRU-CQCC-F0-F
-if errorlevel 1 goto :failed
-
+python improvedCQCC_prepare_dataset.py --stage all --workers 2 || exit /b 1
+python improvedCQCC_run_degraded_test.py --stage all --workers 2 || exit /b 1
+python improvedCQCC_prepare_dataset.py --stage verify || exit /b 1
+python improvedCQCC_run_degraded_test.py --stage verify || exit /b 1
+python improvedCQCC_train.py --model all || exit /b 1
+python improvedCQCC_retrain.py --model all || exit /b 1
+python improvedCQCC_cqcc_train.py --stage check || exit /b 1
+python improvedCQCC_cqcc_train.py --stage cv || exit /b 1
+python improvedCQCC_f0_train.py --stage cv || exit /b 1
+python improvedCQCC_cqcc_f0_fusion.py --stage self-test || exit /b 1
+python improvedCQCC_cqcc_f0_fusion.py --stage oof || exit /b 1
+python improvedCQCC_cqcc_f0_fusion.py --stage fit || exit /b 1
+python improvedCQCC_cqcc_retrain.py || exit /b 1
+python improvedCQCC_f0_retrain.py || exit /b 1
 echo.
-echo COMPLETE: All four models finished. Outputs are under D:\Thesis\models and D:\Thesis\results.
-pause
-exit /b 0
-
-:run
-set "CURRENT_STEP=%*"
-echo.
-echo Running: %CURRENT_STEP%
-%*
-exit /b %errorlevel%
-
-:failed
-echo.
-echo ERROR: Pipeline stopped at: %CURRENT_STEP%
-echo Fix the error shown above before rerunning.
-pause
-exit /b 1
+echo DEVELOPMENT COMPLETE. Review all validation results before any held-out evaluation.
+echo If approved, run: python improvedCQCC_evaluate.py --model all
+echo Then: python improvedCQCC_cqcc_f0_fusion.py --stage evaluate
+echo For latency: python improvedCQCC_latency_test.py --model CNN-GRU-CQCC-F0-F --stage benchmark
