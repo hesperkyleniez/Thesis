@@ -1737,7 +1737,7 @@ if __name__ == "__main__":
 _SOURCE_improvedCQCC_v25_fusion_window = r'''
 """Use v25 AUC-selected CQCC/F0 experts with the unchanged v22 window fusion.
 
-Prerequisites in E:\\Thesis\\code:
+Prerequisites in D:\\Thesis\\code:
     cqcc_train.py, f0_train.py, cqcc_f0_fusion_v19_calibrated.py,
     cqcc_f0_fusion_v22_window_level.py, v25_aux_train_auc.py
 
@@ -1918,7 +1918,7 @@ clip BEFORE the loss is computed. The nine v22 features, Platt calibration,
 mean-logit inference, acoustic experts, augmentation, and all original feature
 caches remain unchanged.
 
-Prerequisites alongside this script in E:\\Thesis\\code:
+Prerequisites alongside this script in D:\\Thesis\\code:
     cqcc_f0_fusion_v19_calibrated.py
     cqcc_f0_fusion_v22_window_level.py
     v25_aux_train_auc.py
@@ -2328,7 +2328,7 @@ Development:
 OPTIONAL held-out evaluation (after reviewing development-fold results):
     python v28_temporal_evidence_fusion.py --stage evaluate
 
-Dependencies alongside this file in E:\\Thesis\\code:
+Dependencies alongside this file in D:\\Thesis\\code:
     config.py, robustness.py, train.py, cqcc_train.py, f0_train.py,
     cqcc_f0_fusion_v19_calibrated.py, cqcc_f0_fusion_v22_window_level.py,
     v25_aux_train_auc.py, v25_fusion_window.py, v27_clip_optimized_fusion.py

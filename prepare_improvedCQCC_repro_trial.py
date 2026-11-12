@@ -72,7 +72,7 @@ def setup(root,name,source):
                 raise SystemExit('ERROR: Unexpected baseline trainer; refusing unsafe patch')
     cfg=source/'improvedCQCC_config.py'
     old=cfg.read_text(encoding='utf8')
-    if 'BASE_DIR      = os.environ.get("THESIS_BASE_DIR", r"E:\\Thesis")' not in old:
+    if 'BASE_DIR      = os.environ.get("THESIS_BASE_DIR", r"D:\\Thesis")' not in old:
         raise SystemExit('ERROR: Source config uses an unexpected dataset-root declaration')
     patterns={
         'MODELS_DIR': 'MODELS_DIR    = os.path.join(BASE_DIR, "reproducibility", '+repr(name)+', "models")',
@@ -160,7 +160,7 @@ def compare(root,name,model):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('action',choices=['setup','compare'])
-    p.add_argument('--root',default=r'E:\Thesis',help='Existing original thesis data root')
+    p.add_argument('--root',default=r'D:\Thesis',help='Existing original thesis data root')
     p.add_argument('--name',default='trial01',help='Name for NEW isolated experiment')
     p.add_argument('--model',default='CNN-only',choices=MODELS)
     args=p.parse_args()

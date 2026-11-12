@@ -3,7 +3,7 @@ import os
 import math
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR      = os.environ.get("THESIS_BASE_DIR", r"E:\Thesis")
+BASE_DIR      = os.environ.get("THESIS_BASE_DIR", r"D:\Thesis")
 TRAIN_DIR     = os.path.join(BASE_DIR, "Training and Validation Set")
 TEST_DIR      = os.path.join(BASE_DIR, "Held out Test set")
 CODE_DIR      = os.path.join(BASE_DIR, "code")

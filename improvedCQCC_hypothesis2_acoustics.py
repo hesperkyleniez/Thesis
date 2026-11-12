@@ -1181,7 +1181,7 @@ def generate_full_chapter4_report(output, res, summary):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--root',type=Path,default=Path(os.environ.get('THESIS_BASE_DIR',r'E:\Thesis')),
+    p.add_argument('--root',type=Path,default=Path(os.environ.get('THESIS_BASE_DIR',r'D:\Thesis')),
                    help='Thesis root containing features/ and features_experiments/')
     p.add_argument('--stage',choices=('check','run','report','full'),default='check',
                    help='report generates Chapter 4 tables/figures using existing H2 CSV+JSON, without rescanning features')
