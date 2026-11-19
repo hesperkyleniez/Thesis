@@ -44,6 +44,14 @@ PROPOSED_ARTIFACTS = {
 }
 LIVE_HISTORY_LIMIT = 60
 LIVE_MIN_RMS = 0.002
+# Tab/system audio is often quieter than a close mic; avoid skipping real speech.
+LIVE_MIN_PEAK = 0.004
+MAX_LIVE_WINDOWS_PER_CHUNK = 2
+DECISION_THRESHOLD = 0.50
+
+def decision_label(probability):
+    """Map AI probability to AI/Real using a fixed 0.50 threshold."""
+    return "AI" if float(probability) >= DECISION_THRESHOLD else "Real"
 _MODEL_CACHE = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 _LIVE_SESSION_LOCK = threading.Lock()
@@ -139,6 +147,8 @@ def _load_proposed_model():
 
         v28.load_artifact = load_relocated_artifact
         runner = module.Runner()
+        # GUI uses a fixed 0.50 decision threshold instead of the tuned artifact cutoff.
+        runner.threshold = DECISION_THRESHOLD
     finally:
         config.MODELS_DIR = original_models_dir
     return runner, "proposed", runner.paths
@@ -179,8 +189,13 @@ def predict_window(window, model, feature, fusion_history=()):
     """Return one window score and processing latency (feature extraction included)."""
     started = time.perf_counter()
     if feature == "proposed":
-        probability, label, feature_row, _ = model.process_window(window, previous_rows=fusion_history)
-        return probability, (time.perf_counter() - started) * 1000, label, feature_row
+        probability, _, feature_row, _ = model.process_window(window, previous_rows=fusion_history)
+        return (
+            float(probability),
+            (time.perf_counter() - started) * 1000,
+            decision_label(probability),
+            feature_row,
+        )
     if feature == "logmel":
         x = torch.from_numpy(extract_logmel(window)[None, None]).float().to(DEVICE)
         with torch.inference_mode():
@@ -191,7 +206,7 @@ def predict_window(window, model, feature, fusion_history=()):
         with torch.inference_mode():
             logit = model(x)
     probability = float(torch.sigmoid(logit.reshape(-1)[0]).item())
-    return probability, (time.perf_counter() - started) * 1000, ("AI" if probability >= 0.5 else "Real"), None
+    return probability, (time.perf_counter() - started) * 1000, decision_label(probability), None
 
 def normalize_for_model(audio):
     """Match the zero-mean, unit-variance, peak-normalized training waveform path."""
@@ -231,7 +246,7 @@ def analyze(audio_value, model_name):
                      f"{p_ai * 100:.1f}%", label, f"{window_ms:.1f} ms"])
     total_ms = (time.perf_counter() - started) * 1000
     final_ai = float(np.mean(probabilities))
-    final_label = "AI" if final_ai >= 0.5 else "Real"
+    final_label = decision_label(final_ai)
     final_percent = f"{final_ai * 100:.1f}%"
     return rows, final_percent, final_label, f"{total_ms:.1f} ms", f"{final_percent} ({final_label}, {len(probabilities)} windows)", "Offline clip analyzed."
 
@@ -247,6 +262,14 @@ def _empty_live_state():
 
 def _empty_result_state():
     return {"probability": "", "label": "", "running": "", "latency": ""}
+
+def _window_has_speech(raw_window):
+    """Gate on peak and RMS so quiet Chrome-tab speech is still scored."""
+    peak = float(np.max(np.abs(raw_window)))
+    if peak < LIVE_MIN_PEAK:
+        return False
+    rms = float(np.sqrt(np.mean(raw_window * raw_window)))
+    return rms >= LIVE_MIN_RMS or peak >= (LIVE_MIN_PEAK * 2)
 
 def _set_session_active(token, active):
     with _LIVE_SESSION_LOCK:
@@ -331,16 +354,19 @@ def analyze_live_chunk(audio_value, model_name, state, result_state):
     fusion_history = [np.asarray(row, dtype=np.float32) for row in state.get("fusion_history", [])]
     newest_probability = newest_label = newest_latency = ""
     skipped_windows = 0
+    windows_done = 0
 
-    while len(buffer) >= WIN_SAMPLES:
+    while len(buffer) >= WIN_SAMPLES and windows_done < MAX_LIVE_WINDOWS_PER_CHUNK:
         raw_window = buffer[:WIN_SAMPLES]
         count += 1
+        windows_done += 1
         start_seconds = (count - 1) * HOP_SAMPLES / SAMPLE_RATE
+        peak = float(np.max(np.abs(raw_window)))
         rms = float(np.sqrt(np.mean(raw_window * raw_window)))
-        if rms < LIVE_MIN_RMS:
+        if not _window_has_speech(raw_window):
             skipped_windows += 1
             row = [count, f"{start_seconds:.2f}–{start_seconds + WIN_SAMPLES / SAMPLE_RATE:.2f}s",
-                   "—", "No speech", f"input RMS {rms:.4f}"]
+                   "—", "No speech", f"peak {peak:.4f} / RMS {rms:.4f}"]
             rows.append(row)
             rows = rows[-LIVE_HISTORY_LIMIT:]
             buffer = buffer[HOP_SAMPLES:]
@@ -367,14 +393,17 @@ def analyze_live_chunk(audio_value, model_name, state, result_state):
     running_probability = ""
     if probabilities:
         mean_probability = float(np.mean(probabilities))
-        running_probability = f"{mean_probability * 100:.1f}% ({'AI' if mean_probability >= 0.5 else 'Real'}, {len(probabilities)} speech windows)"
+        running_probability = (
+            f"{mean_probability * 100:.1f}% "
+            f"({decision_label(mean_probability)}, {len(probabilities)} speech windows)"
+        )
     if not _is_session_active(token):
         return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
     if not newest_probability:
         remaining = max(0.0, (WIN_SAMPLES - len(buffer)) / SAMPLE_RATE)
         detail = "No speech detected in the latest window." if skipped_windows else f"Listening… {remaining:.2f}s until the first window."
         return (rows, result_state["probability"], result_state["label"],
-                result_state["running"], result_state["latency"], detail,
+                running_probability or result_state["running"], result_state["latency"], detail,
                 new_state, result_state)
     new_result_state = {
         "probability": newest_probability,
@@ -400,19 +429,26 @@ def _process_capture_live_chunk(chunk, model_name, session_id):
     count = int(state["window_count"])
     probabilities = list(state.get("probabilities", []))
     fusion_history = [np.asarray(row, dtype=np.float32) for row in state.get("fusion_history", [])]
+    last_probability = state.get("last_probability") or ""
+    last_label = state.get("last_label") or ""
+    last_latency = state.get("last_latency") or ""
     newest_probability = newest_label = newest_latency = ""
     skipped_windows = 0
+    windows_done = 0
     status = "Capturing laptop / Chrome audio…"
 
-    while len(buffer) >= WIN_SAMPLES:
+    # Cap work per request so the UI stays responsive instead of batching seconds of lag.
+    while len(buffer) >= WIN_SAMPLES and windows_done < MAX_LIVE_WINDOWS_PER_CHUNK:
         raw_window = buffer[:WIN_SAMPLES]
         count += 1
+        windows_done += 1
         start_seconds = (count - 1) * HOP_SAMPLES / SAMPLE_RATE
+        peak = float(np.max(np.abs(raw_window)))
         rms = float(np.sqrt(np.mean(raw_window * raw_window)))
-        if rms < LIVE_MIN_RMS:
+        if not _window_has_speech(raw_window):
             skipped_windows += 1
             row = [count, f"{start_seconds:.2f}–{start_seconds + WIN_SAMPLES / SAMPLE_RATE:.2f}s",
-                   "—", "No speech", f"input RMS {rms:.4f}"]
+                   "—", "No speech", f"peak {peak:.4f} / RMS {rms:.4f}"]
             rows.append(row)
             rows = rows[-LIVE_HISTORY_LIMIT:]
             buffer = buffer[HOP_SAMPLES:]
@@ -430,6 +466,7 @@ def _process_capture_live_chunk(chunk, model_name, session_id):
         newest_probability = f"{probability * 100:.1f}%"
         newest_label = label
         newest_latency = f"{latency_ms:.1f} ms"
+        last_probability, last_label, last_latency = newest_probability, newest_label, newest_latency
         buffer = buffer[HOP_SAMPLES:]
 
     running_probability = ""
@@ -437,12 +474,17 @@ def _process_capture_live_chunk(chunk, model_name, session_id):
         mean_probability = float(np.mean(probabilities))
         running_probability = (
             f"{mean_probability * 100:.1f}% "
-            f"({'AI' if mean_probability >= 0.5 else 'Real'}, {len(probabilities)} speech windows)"
+            f"({decision_label(mean_probability)}, {len(probabilities)} speech windows)"
         )
+    display_probability = newest_probability or last_probability
+    display_label = newest_label or last_label
+    display_latency = newest_latency or last_latency
     if newest_probability:
-        status = "Live screen/tab audio analysis running."
-    elif skipped_windows:
+        status = f"Live: {display_label} ({display_probability}). Table updates below."
+    elif skipped_windows and not display_probability:
         status = "No speech detected in the latest window."
+    elif skipped_windows:
+        status = f"Quiet moment — last score {display_label} ({display_probability})."
     else:
         remaining = max(0.0, (WIN_SAMPLES - len(buffer)) / SAMPLE_RATE)
         status = f"Listening to shared audio… {remaining:.2f}s until the first window."
@@ -454,15 +496,18 @@ def _process_capture_live_chunk(chunk, model_name, session_id):
         "probabilities": probabilities,
         "fusion_history": fusion_history,
         "session_token": session_id,
+        "last_probability": last_probability,
+        "last_label": last_label,
+        "last_latency": last_latency,
     }
     with _CAPTURE_LIVE_LOCK:
         _CAPTURE_LIVE_STATE[session_id] = new_state
 
     payload = {
         "rows": rows,
-        "probability": newest_probability or "",
-        "label": newest_label or "",
-        "latency": newest_latency or "",
+        "probability": display_probability,
+        "label": display_label,
+        "latency": display_latency,
         "running_summary": running_probability,
         "status": status,
     }
@@ -646,10 +691,29 @@ CHROME_CAPTURE_SCRIPT = r"""
     return 'CNN–GRU + CQCC + F0 (Prediction-Level Fusion + Causal Temporal Correction)';
   }
 
+  function takePendingAudio(maxSeconds) {
+    const rate = audioContext ? audioContext.sampleRate : 48000;
+    const maxSamples = Math.floor(maxSeconds * rate);
+    let total = 0;
+    const parts = [];
+    while (pendingChunks.length && total < maxSamples) {
+      const part = pendingChunks.shift();
+      parts.push(part);
+      total += part.length;
+    }
+    // If we fell far behind, drop excess backlog so scores stay near-real-time.
+    const backlogLimit = rate * 1.5;
+    let backlog = pendingChunks.reduce((sum, part) => sum + part.length, 0);
+    while (backlog > backlogLimit && pendingChunks.length) {
+      backlog -= pendingChunks.shift().length;
+    }
+    return parts;
+  }
+
   async function flushLiveChunk() {
     if (!capturing || liveBusy || !pendingChunks.length || !audioContext) return;
-    const parts = pendingChunks;
-    pendingChunks = [];
+    const parts = takePendingAudio(0.6);
+    if (!parts.length) return;
     const audioBlob = makeWav(parts, audioContext.sampleRate);
     if (audioBlob.size < 100) return;
     liveBusy = true;
@@ -661,7 +725,11 @@ CHROME_CAPTURE_SCRIPT = r"""
       const response = await fetch('/capture-audio-live', { method: 'POST', body: form });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || data.error || 'Live analysis failed.');
-      if (data.status) setStatus(data.status);
+      if (data.label && data.probability) {
+        setStatus('Live: ' + data.label + ' (' + data.probability + '). ' + (data.running_summary || ''));
+      } else if (data.status) {
+        setStatus(data.status);
+      }
     } catch (error) {
       setStatus('Live analysis error: ' + error.message);
     } finally {
@@ -768,10 +836,8 @@ CHROME_CAPTURE_SCRIPT = r"""
       starting = false;
       stopping = false;
       setButtons(true);
-      setStatus('Streaming shared audio. Results update in the table below. Click Stop & Analyze when done.');
-      liveTimer = setInterval(flushLiveChunk, 500);
-      const table = document.getElementById('per-window-results');
-      if (table) table.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      setStatus('Streaming shared audio. Results update live below. Click Stop & Analyze when done.');
+      liveTimer = setInterval(flushLiveChunk, 300);
       displayStream.getVideoTracks().forEach((track) => {
         track.addEventListener('ended', () => { if (capturing) finishCapture(); }, { once: true });
       });
@@ -805,6 +871,75 @@ CHROME_CAPTURE_SCRIPT = r"""
 })();
 """
 
+TABLE_AUTO_FOLLOW_SCRIPT = r"""
+(() => {
+  if (window.__tableAutoFollowInstalled) return;
+  window.__tableAutoFollowInstalled = true;
+
+  const ROOT_ID = 'per-window-results';
+  const NEAR_BOTTOM_PX = 56;
+  let followBottom = true;
+  let boundEl = null;
+
+  function findScrollEl(root) {
+    if (!root) return null;
+    const nodes = [root, ...root.querySelectorAll('div, table, section')];
+    let best = null;
+    for (const el of nodes) {
+      const style = window.getComputedStyle(el);
+      const overflowY = style.overflowY;
+      if ((overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
+          el.scrollHeight > el.clientHeight + 2) {
+        if (!best || el.scrollHeight > best.scrollHeight) best = el;
+      }
+    }
+    if (best) return best;
+    root.classList.add('per-window-scroll');
+    return root;
+  }
+
+  function isNearBottom(el) {
+    return (el.scrollHeight - el.scrollTop - el.clientHeight) <= NEAR_BOTTOM_PX;
+  }
+
+  function bindScroll(el) {
+    if (!el || el === boundEl) return;
+    if (boundEl) boundEl.removeEventListener('scroll', onUserScroll);
+    boundEl = el;
+    el.addEventListener('scroll', onUserScroll, { passive: true });
+  }
+
+  function onUserScroll(event) {
+    followBottom = isNearBottom(event.currentTarget);
+  }
+
+  function stickIfFollowing() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root) return;
+    const el = findScrollEl(root);
+    if (!el) return;
+    bindScroll(el);
+    if (followBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  function watch() {
+    const root = document.getElementById(ROOT_ID);
+    if (!root || root._autoFollowWatching) return;
+    root._autoFollowWatching = true;
+    const observer = new MutationObserver(() => {
+      requestAnimationFrame(stickIfFollowing);
+    });
+    observer.observe(root, { childList: true, subtree: true, characterData: true });
+    stickIfFollowing();
+  }
+
+  const boot = () => watch();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+  setInterval(watch, 1000);
+})();
+"""
+
 APP_CSS = """
 #audio-input[data-uploaded-filename]:not([data-uploaded-filename=""])::after {
     content: attr(data-uploaded-filename);
@@ -824,6 +959,10 @@ APP_CSS = """
     padding: 16px;
     margin: 0 0 8px 0;
     background: var(--block-background-fill);
+}
+#per-window-results {
+    max-height: 360px;
+    overflow-y: auto;
 }
 """
 
@@ -892,7 +1031,7 @@ with gr.Blocks(title="Speech Authenticity") as demo:
 
     model_select.change(change_active_model, [model_select], [selected_model, active_model, model_status, audio_input])
     input_mode.change(switch_input_mode, [input_mode], [audio_input, chrome_panel, live_status])
-    capture_timer = gr.Timer(0.5)
+    capture_timer = gr.Timer(0.25)
     capture_timer.tick(
         poll_chrome_capture_ui,
         outputs=[per_window, final_percent, final_label, live_running, total_latency, live_status],
@@ -1036,7 +1175,7 @@ if __name__ == "__main__":
         path="/",
         max_file_size="10mb",
         css=APP_CSS,
-        js=CHROME_CAPTURE_SCRIPT,
-        head=f"<script>{CHROME_CAPTURE_SCRIPT}</script>",
+        js=CHROME_CAPTURE_SCRIPT + "\n" + TABLE_AUTO_FOLLOW_SCRIPT,
+        head=f"<script>{CHROME_CAPTURE_SCRIPT}</script><script>{TABLE_AUTO_FOLLOW_SCRIPT}</script>",
     )
     uvicorn.run(mounted_app, host="127.0.0.1", port=7860)
