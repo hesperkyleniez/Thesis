@@ -48,10 +48,33 @@ LIVE_MIN_RMS = 0.002
 LIVE_MIN_PEAK = 0.004
 MAX_LIVE_WINDOWS_PER_CHUNK = 2
 DECISION_THRESHOLD = 0.50
+# Keep temporal context short so mixed Real/AI speech can flip quickly.
+LIVE_FUSION_HISTORY = 6
+LIVE_RECENT_WINDOW_COUNT = 10
 
 def decision_label(probability):
     """Map AI probability to AI/Real using a fixed 0.50 threshold."""
     return "AI" if float(probability) >= DECISION_THRESHOLD else "Real"
+
+def _trim_fusion_history(fusion_history):
+    if len(fusion_history) > LIVE_FUSION_HISTORY:
+        return fusion_history[-LIVE_FUSION_HISTORY:]
+    return fusion_history
+
+def _mixed_running_summary(probabilities):
+    """Summarize recent windows so mixed Real/AI content stays visible."""
+    if not probabilities:
+        return ""
+    recent = list(probabilities[-LIVE_RECENT_WINDOW_COUNT:])
+    mean_probability = float(np.mean(recent))
+    ai_n = sum(1 for p in recent if float(p) >= DECISION_THRESHOLD)
+    real_n = len(recent) - ai_n
+    latest = decision_label(recent[-1])
+    return (
+        f"latest {latest} ({recent[-1] * 100:.1f}%) | "
+        f"last {len(recent)}: {ai_n} AI / {real_n} Real "
+        f"(mean {mean_probability * 100:.1f}%)"
+    )
 _MODEL_CACHE = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 _LIVE_SESSION_LOCK = threading.Lock()
@@ -371,11 +394,16 @@ def analyze_live_chunk(audio_value, model_name, state, result_state):
             rows = rows[-LIVE_HISTORY_LIMIT:]
             buffer = buffer[HOP_SAMPLES:]
             continue
+        prev_label = decision_label(probabilities[-1]) if probabilities else ""
         probability, latency_ms, label, feature_row = predict_window(
             normalize_for_model(raw_window), model, feature, fusion_history
         )
+        # Soft-reset temporal memory when Real↔AI flips so mixed clips react faster.
+        if prev_label and label != prev_label:
+            fusion_history = fusion_history[-2:] if len(fusion_history) > 2 else list(fusion_history)
         if feature_row is not None:
             fusion_history.append(np.asarray(feature_row, dtype=np.float32))
+            fusion_history = _trim_fusion_history(fusion_history)
         probabilities.append(probability)
         row = [count, f"{start_seconds:.2f}–{start_seconds + WIN_SAMPLES / SAMPLE_RATE:.2f}s",
                f"{probability * 100:.1f}%", label, f"{latency_ms:.1f} ms"]
@@ -390,13 +418,7 @@ def analyze_live_chunk(audio_value, model_name, state, result_state):
         "buffer": buffer, "window_count": count, "rows": rows,
         "probabilities": probabilities, "fusion_history": fusion_history, "session_token": token,
     }
-    running_probability = ""
-    if probabilities:
-        mean_probability = float(np.mean(probabilities))
-        running_probability = (
-            f"{mean_probability * 100:.1f}% "
-            f"({decision_label(mean_probability)}, {len(probabilities)} speech windows)"
-        )
+    running_probability = _mixed_running_summary(probabilities)
     if not _is_session_active(token):
         return (gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip())
     if not newest_probability:
@@ -453,11 +475,16 @@ def _process_capture_live_chunk(chunk, model_name, session_id):
             rows = rows[-LIVE_HISTORY_LIMIT:]
             buffer = buffer[HOP_SAMPLES:]
             continue
+        prev_label = decision_label(probabilities[-1]) if probabilities else (last_label or "")
         probability, latency_ms, label, feature_row = predict_window(
             normalize_for_model(raw_window), model, feature, fusion_history
         )
+        # Soft-reset temporal memory when Real↔AI flips so mixed clips react faster.
+        if prev_label in {"AI", "Real"} and label != prev_label:
+            fusion_history = fusion_history[-2:] if len(fusion_history) > 2 else list(fusion_history)
         if feature_row is not None:
             fusion_history.append(np.asarray(feature_row, dtype=np.float32))
+            fusion_history = _trim_fusion_history(fusion_history)
         probabilities.append(probability)
         row = [count, f"{start_seconds:.2f}–{start_seconds + WIN_SAMPLES / SAMPLE_RATE:.2f}s",
                f"{probability * 100:.1f}%", label, f"{latency_ms:.1f} ms"]
@@ -469,18 +496,12 @@ def _process_capture_live_chunk(chunk, model_name, session_id):
         last_probability, last_label, last_latency = newest_probability, newest_label, newest_latency
         buffer = buffer[HOP_SAMPLES:]
 
-    running_probability = ""
-    if probabilities:
-        mean_probability = float(np.mean(probabilities))
-        running_probability = (
-            f"{mean_probability * 100:.1f}% "
-            f"({decision_label(mean_probability)}, {len(probabilities)} speech windows)"
-        )
+    running_probability = _mixed_running_summary(probabilities)
     display_probability = newest_probability or last_probability
     display_label = newest_label or last_label
     display_latency = newest_latency or last_latency
     if newest_probability:
-        status = f"Live: {display_label} ({display_probability}). Table updates below."
+        status = f"Live latest: {display_label} ({display_probability}). {running_probability}"
     elif skipped_windows and not display_probability:
         status = "No speech detected in the latest window."
     elif skipped_windows:
