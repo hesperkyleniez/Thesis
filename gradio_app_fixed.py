@@ -105,11 +105,14 @@ def decode_audio_value(audio_value):
         if not path:
             raise ValueError("Upload an audio file or record with the microphone.")
         path = Path(path)
-        if path.suffix.lower() not in {".wav", ".flac", ".ogg", ".aiff", ".aif", ".au"}:
-            raise ValueError("Use a supported audio file: WAV, FLAC, OGG, AIFF, or AU.")
+        if path.suffix.lower() not in {".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif", ".au"}:
+            raise ValueError("Use a supported audio file: WAV, MP3, FLAC, OGG, AIFF, or AU.")
         if path.stat().st_size > MAX_BYTES:
             raise ValueError("Audio files must be 10 MB or smaller.")
-        audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
+        if path.suffix.lower() == ".mp3":
+            audio, sample_rate = librosa.load(str(path), sr=None, mono=True)
+        else:
+            audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
     if audio.ndim == 2:
         audio = audio.mean(axis=1)
     if audio.ndim != 1 or audio.size == 0:
@@ -603,7 +606,7 @@ def switch_input_mode(mode):
         return (
             gr.update(visible=True, sources=["upload"], streaming=False),
             gr.update(visible=False),
-            "Upload an audio clip. Results appear in the table below.",
+            "Upload WAV, MP3, FLAC, OGG, AIFF, or AU. Results appear in the table below.",
         )
     if mode == "Microphone":
         return (
@@ -1014,13 +1017,13 @@ with gr.Blocks(title="Speech Authenticity") as demo:
         model_select = gr.Dropdown(MODEL_CHOICES, value=PROPOSED_MODEL, label="Change Model")
 
     input_mode = gr.Radio(
-        ["Upload", "Microphone", "Share Chrome tab"],
+        ["Upload", "Microphone", "Stream"],
         value="Upload",
         label="Input source",
         elem_id="input-mode",
     )
     audio_input = gr.Audio(
-        label="Audio clip",
+        label="Audio clip (WAV, MP3, FLAC, OGG, AIFF, AU)",
         sources=["upload"],
         type="filepath",
         format="wav",
@@ -1038,7 +1041,7 @@ with gr.Blocks(title="Speech Authenticity") as demo:
     live_running = gr.Textbox(label="Running live-clip AI probability", interactive=False)
     live_status = gr.Textbox(
         label="Analysis status",
-        value="Choose Upload, Microphone, or Share Chrome tab." if DEFAULT_MODEL_READY else "The active model must finish loading before analysis can start.",
+        value="Choose Upload, Microphone, or Stream." if DEFAULT_MODEL_READY else "The active model must finish loading before analysis can start.",
         interactive=False,
     )
     live_state = gr.State(_empty_live_state())
