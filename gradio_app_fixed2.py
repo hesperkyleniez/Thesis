@@ -179,17 +179,28 @@ def _load_proposed_model():
         config.MODELS_DIR = original_models_dir
     return runner, "proposed", runner.paths
 
+def _warmup_loaded_model(model, feature):
+    """Prime feature extractors and first PyTorch pass so measured window latency stays steady."""
+    dummy = np.zeros(WIN_SAMPLES, dtype=np.float32)
+    history = []
+    for _ in range(2):
+        _, _, _, feature_row = predict_window(dummy, model, feature, history)
+        if feature_row is not None:
+            history.append(np.asarray(feature_row, dtype=np.float32))
+
 def load_active_model(model_name):
     """Load built-in models only; user checkpoint uploads are intentionally unsupported."""
     with _MODEL_CACHE_LOCK:
         if model_name not in _MODEL_CACHE:
             if model_name == PROPOSED_MODEL:
-                _MODEL_CACHE[model_name] = _load_proposed_model()
+                loaded = _load_proposed_model()
             elif model_name in SINGLE_MODELS:
                 model, feature, path = _load_single_model(model_name)
-                _MODEL_CACHE[model_name] = (model, feature, {"checkpoint": path})
+                loaded = (model, feature, {"checkpoint": path})
             else:
                 raise ValueError(f"Unknown model selection: {model_name}")
+            _warmup_loaded_model(loaded[0], loaded[1])
+            _MODEL_CACHE[model_name] = loaded
         return _MODEL_CACHE[model_name]
 
 def model_readiness(model_name):
@@ -199,8 +210,6 @@ def model_readiness(model_name):
         return True, ""
     except Exception as exc:
         return False, f"Model not ready — {exc}"
-
-DEFAULT_MODEL_READY, DEFAULT_MODEL_STATUS = model_readiness(PROPOSED_MODEL)
 
 def change_active_model(model_name):
     ready, status = model_readiness(model_name)
@@ -233,6 +242,9 @@ def predict_window(window, model, feature, fusion_history=()):
             logit = model(x)
     probability = float(torch.sigmoid(logit.reshape(-1)[0]).item())
     return probability, (time.perf_counter() - started) * 1000, decision_label(probability), None
+
+# Warmup runs during readiness, so predict_window must already be defined.
+DEFAULT_MODEL_READY, DEFAULT_MODEL_STATUS = model_readiness(PROPOSED_MODEL)
 
 def normalize_for_model(audio):
     """Match the zero-mean, unit-variance, peak-normalized training waveform path."""
